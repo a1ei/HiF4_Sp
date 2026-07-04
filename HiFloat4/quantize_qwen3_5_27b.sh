@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export HF_ENDPOINT="https://hf-mirror.com"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "hif4" ]]; then
   echo "错误：当前环境不是 hif4。请先执行: conda activate hif4" >&2
@@ -10,15 +11,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 MODEL="${MODEL:-Qwen/Qwen3.5-27B}"
-OUTPUT="${OUTPUT:-Qmodel}"
+OUTPUT="${OUTPUT:-Qmodel/Qwen3.5-27b-Hif4-AWQ}"
 GPTQ="${GPTQ:-false}"
+SMOOTHQUANT="${SMOOTHQUANT:-false}"
+AWQ="${AWQ:-true}"
 DTYPE="${DTYPE:-float16}"
+#虽然参数开头是GPTQ，但实际上是用于所有量化方法的校准数据集、样本数和序列长度
 GPTQ_CAL_DATASET="${GPTQ_CAL_DATASET:-c4}"
 GPTQ_CAL_NSAMPLES="${GPTQ_CAL_NSAMPLES:-512}"
 GPTQ_CAL_SEQLEN="${GPTQ_CAL_SEQLEN:-512}"
 GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
 BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}"
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
+SMOOTHQUANT_ALPHA="${SMOOTHQUANT_ALPHA:-0.5}"
+AWQ_N_GRID="${AWQ_N_GRID:-20}"
 
 cd "${REPO_ROOT}"
 
@@ -45,10 +51,14 @@ python HiFloat4/main.py \
   --hif4w true \
   --hif4_weight_format "${HIF4_WEIGHT_FORMAT}" \
   --gptq "${GPTQ}" \
+  --smoothquant "${SMOOTHQUANT}" \
+  --awq "${AWQ}" \
   --gptq_save_path "${OUTPUT}" \
   --gptq_cal_dataset "${GPTQ_CAL_DATASET}" \
   --gptq_cal_nsamples "${GPTQ_CAL_NSAMPLES}" \
   --gptq_cal_seqlen "${GPTQ_CAL_SEQLEN}" \
   --gptq_percdamp "${GPTQ_PERCDAMP}" \
   --block_size_linear "${BLOCK_SIZE_LINEAR}" \
+  --smoothquant_alpha "${SMOOTHQUANT_ALPHA}" \
+  --awq_n_grid "${AWQ_N_GRID}" \
   "$@"

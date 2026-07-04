@@ -39,11 +39,11 @@ def str2path(v):
     return str(v)
 
 
-def configure_logging(log_dir: str = "hif4gptq_logs") -> logging.Logger:
+def configure_logging(log_dir: str = "hif4_logs") -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.log")
 
-    logger = logging.getLogger("hif4gptq")
+    logger = logging.getLogger("hif4")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
@@ -108,9 +108,11 @@ def _no_split_module_classes(model):
     return mapping.get(model_type, ["LlamaDecoderLayer", "Qwen3DecoderLayer", "Qwen3_5DecoderLayer"])
 
 
-def _save_quantized_model(model, path: str) -> None:
+def _save_quantized_model(model, path: str, tokenizer=None) -> None:
     os.makedirs(path, exist_ok=True)
     model.save_pretrained(path, safe_serialization=False, max_shard_size="5GB")
+    if tokenizer is not None:
+        tokenizer.save_pretrained(path)
     logging.info("Saved quantized model to %s", path)
 
 
@@ -321,6 +323,22 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument("--gptq_load_path", type=str2path, default=None)
     parser.add_argument("--gptq_save_path", type=str2path, default=None)
     parser.add_argument("--block_size_linear", type=int, default=64)
+    parser.add_argument("--smoothquant", type=str2bool, default=False)
+    parser.add_argument("--smoothquant_alpha", type=float, default=0.5)
+    parser.add_argument("--awq", type=str2bool, default=False)
+    parser.add_argument("--awq_n_grid", type=int, default=20)
+    parser.add_argument("--flatquant", type=str2bool, default=False)
+    parser.add_argument("--flatquant_epochs", type=int, default=15)
+    parser.add_argument("--flatquant_cali_bsz", type=int, default=1)
+    parser.add_argument("--flatquant_lr", type=float, default=1e-5)
+    parser.add_argument("--flatquant_cali_trans", type=str2bool, default=True)
+    parser.add_argument("--flatquant_add_diag", type=str2bool, default=True)
+    parser.add_argument("--flatquant_lwc", type=str2bool, default=True)
+    parser.add_argument("--flatquant_lac", type=str2bool, default=True)
+    parser.add_argument("--flatquant_direct_inv", type=str2bool, default=True)
+    parser.add_argument("--flatquant_diag_init", type=str, default="sq_style", choices=["sq_style", "one_style"])
+    parser.add_argument("--flatquant_diag_alpha", type=float, default=0.3)
+    parser.add_argument("--flatquant_matrix_path", type=str2path, default=None)
 
     return parser.parse_args() if interactive else parser.parse_args("")
 
@@ -335,10 +353,13 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
     args.hif4_weight_qtype = _hif4_weight_qtype(args.hif4_weight_format)
     if args.hif4_weight_qtype == "hifx4_1" and args.gptq and args.block_size_linear != 64:
         raise ValueError("hif4-1 GPTQ requires --block_size_linear 64.")
+    enabled_weight_methods = sum(bool(x) for x in (args.gptq, args.smoothquant, args.awq, args.flatquant))
+    if enabled_weight_methods > 1:
+        raise ValueError("--gptq, --smoothquant, --awq, and --flatquant cannot be enabled at the same time.")
 
     dtype = _torch_dtype_from_arg(args.dtype)
     load_device_map = "cpu"
-    if args.hif4w and not args.gptq:
+    if args.hif4w and not args.gptq and not args.smoothquant and not args.awq and not args.flatquant:
         quant_device = _quant_device()
         if quant_device.type != "cuda":
             raise RuntimeError("HiF4 RTN quantization requires CUDA.")
@@ -378,6 +399,61 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
         if args.gptq_save_path:
             _save_quantized_model(model, args.gptq_save_path)
+    elif args.smoothquant:
+        if args.hif4w:
+            logger.info("Both --hif4w and --smoothquant are enabled; SmoothQuant controls weight quantization and HiF4 RTN is skipped.")
+
+        from hif4smoothquant import smoothquant_utils
+        import brq.calib as calib
+
+        logger.info("Quantizing model weights with HiFloat4 SmoothQuant.")
+        trainloader = calib.get_loaders(
+            args.gptq_cal_dataset,
+            nsamples=args.gptq_cal_nsamples,
+            seqlen=args.gptq_cal_seqlen,
+            model=args.model,
+            eval_mode=False,
+        )
+        smoothquant_utils.smoothquant_fwrd(model, trainloader, _quant_device(), args)
+
+        if args.gptq_save_path:
+            _save_quantized_model(model, args.gptq_save_path, tokenizer)
+    elif args.awq:
+        if args.hif4w:
+            logger.info("Both --hif4w and --awq are enabled; AWQ controls weight quantization and HiF4 RTN is skipped.")
+
+        from hif4awq import awq_utils
+        import brq.calib as calib
+
+        logger.info("Quantizing model weights with HiFloat4 AWQ.")
+        trainloader = calib.get_loaders(
+            args.gptq_cal_dataset,
+            nsamples=args.gptq_cal_nsamples,
+            seqlen=args.gptq_cal_seqlen,
+            model=args.model,
+            eval_mode=False,
+        )
+        awq_utils.awq_fwrd(model, trainloader, _quant_device(), args)
+
+        if args.gptq_save_path:
+            _save_quantized_model(model, args.gptq_save_path, tokenizer)
+    elif args.flatquant:
+        if args.hif4w:
+            logger.info("Both --hif4w and --flatquant are enabled; FlatQuant controls weight quantization and HiF4 RTN is skipped.")
+
+        from hif4flatquant import flatquant_fwrd, save_hif4_flatquant_model
+        import brq.calib as calib
+
+        logger.info("Quantizing model weights and Linear inputs with HiFloat4 FlatQuant.")
+        trainloader = calib.get_loaders(
+            args.gptq_cal_dataset,
+            nsamples=args.gptq_cal_nsamples,
+            seqlen=args.gptq_cal_seqlen,
+            model=args.model,
+            eval_mode=False,
+        )
+        flatquant_fwrd(model, trainloader, _quant_device(), args)
+        save_hif4_flatquant_model(model, tokenizer, args.gptq_save_path, args)
     elif args.hif4w:
         logger.info("Quantizing model weights with one-shot HiF4 RTN.")
         model = hif4_rtn_quant(model, args)

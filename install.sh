@@ -95,10 +95,25 @@ pip install -r "$REPO_ROOT/3rdparty/vllm/requirements/build.txt"
 
 # -------- 4. vLLM（editable, source build） --------
 echo "[install.sh] ==> 源码编译安装 vLLM v0.19.1 (editable, no build isolation)"
+#########################################
+# export http_proxy="${http_proxy:-http://127.0.0.1:7897}"
+# export https_proxy="${https_proxy:-http://127.0.0.1:7897}"
+# export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:7897}"
+# export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:7897}"
+
+# git config --global http.proxy "${http_proxy}"
+# git config --global https.proxy "${https_proxy}"
+# git config --global http.version HTTP/1.1
+# git config --global core.compression 0
+# git config --global http.lowSpeedLimit 0
+# git config --global http.lowSpeedTime 999999
+########################################
 pushd "$REPO_ROOT/3rdparty/vllm" >/dev/null
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="0.19.1" \
+SETUPTOOLS_SCM_PRETEND_VERSION="0.19.1" \
 MAX_JOBS="${MAX_JOBS}" \
 CMAKE_ARGS="-DCUDAToolkit_ROOT=${CUDAToolkit_ROOT} -DCUDA_TOOLKIT_ROOT_DIR=${CUDAToolkit_ROOT} -DCUDA_INCLUDE_DIRS=${CUDAToolkit_ROOT}/include -DCUDA_CUDART_LIBRARY=${CUDAToolkit_ROOT}/lib/libcudart.so" \
-    pip install --editable . --no-build-isolation
+    pip install --editable . --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ --extra-index-url https://pypi.org/simple
 popd >/dev/null
 
 # -------- 5. lighteval（editable, 不带 vllm extras） --------
@@ -111,6 +126,12 @@ popd >/dev/null
 
 # -------- 6. HiFloat4 CUDA 扩展 --------
 echo "[install.sh] ==> 编译 HiFloat4 CUDA 扩展"
+export CUDA_HOME=/home/liuzhilei/anaconda3/envs/hif4/targets/x86_64-linux
+
+export CPATH="$CUDA_HOME/include:${CPATH:-}"
+export C_INCLUDE_PATH="$CUDA_HOME/include:${C_INCLUDE_PATH:-}"
+export CPLUS_INCLUDE_PATH="$CUDA_HOME/include:${CPLUS_INCLUDE_PATH:-}"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 pushd "$REPO_ROOT/HiFloat4/hif4_gpu" >/dev/null
 bash build.sh
 popd >/dev/null
