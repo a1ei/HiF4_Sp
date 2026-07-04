@@ -90,6 +90,24 @@ def prepare_model_dir_with_num_experts_per_tok(model_path: str, num_experts_per_
     return dest_dir
 
 
+def maybe_register_hif4_flatquant_model(model_path: str) -> bool:
+    model_path = os.path.abspath(model_path)
+    if not os.path.isdir(model_path):
+        return False
+    flatquant_config = os.path.join(model_path, "hif4_flatquant_config.json")
+    if not os.path.isfile(flatquant_config):
+        return False
+
+    hif4_root = os.path.join(REPO_ROOT, "HiFloat4")
+    if hif4_root not in sys.path:
+        sys.path.insert(0, hif4_root)
+    from hif4flatquant.vllm_custom import register_hif4_flatquant_models
+
+    register_hif4_flatquant_models()
+    print(f"检测到 HiF4 FlatQuant 配置，已注册 vLLM 自定义模型: {flatquant_config}")
+    return True
+
+
 class CustomEvaluationTracker:
     """自定义 Tracker：结果与 details 保存在 ``output_dir/<short_model_name>/{results,details}`` 下，且 details 存为 JSON。"""
 
@@ -358,6 +376,10 @@ def main():
             args.model_path, args.num_experts_per_tok
         )
         print(f"MoE 已覆盖 num_experts_per_tok={args.num_experts_per_tok}，使用目录: {args.model_path}")
+
+    is_hif4_flatquant = maybe_register_hif4_flatquant_model(args.model_path)
+    if is_hif4_flatquant and args.tensor_parallel_size not in (None, 1):
+        raise ValueError("HiF4 FlatQuant vLLM 自定义推理当前只支持 --tensor_parallel_size 1。")
 
     nvf4_activation_scales_path = None
     if args.fake_act_quant == "nvfp4":

@@ -138,41 +138,120 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
 
 ## 量化
 
-默认量化 `Qwen/Qwen3.5-27B`，保存到 `Qmodel/`：
+所有量化命令都在 `hif4` 环境下运行：
 
 ```bash
 conda activate hif4
-bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
-显式指定本地模型和输出目录：
+下面的脚本参数里很多名字带 `GPTQ`，例如 `GPTQ_CAL_DATASET`、`GPTQ_CAL_NSAMPLES`、`GPTQ_CAL_SEQLEN`，以及 Python 参数 `--gptq_cal_dataset`、`--gptq_cal_nsamples`、`--gptq_cal_seqlen`、`--gptq_save_path`。这些名字是历史原因保留下来的，不只给 GPTQ 用；AWQ、SmoothQuant、FlatQuant 也共用这些校准数据和保存路径参数。
+
+### AWQ
+
+`quantize_qwen3_5_27b.sh` 默认就是 AWQ：
 
 ```bash
-MODEL=/path/to/Qwen3.5-27B \
-OUTPUT=/data/Qwen3.5-27B-HiF4-RTN \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-AWQ \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
-使用 GPTQ 路径：
+等价的显式写法：
 
 ```bash
-GPTQ=true \
-GPTQ_CAL_DATASET=c4 \
-GPTQ_CAL_NSAMPLES=512 \
-GPTQ_CAL_SEQLEN=512 \
-OUTPUT=/data/Qwen3.5-27B-HiF4-GPTQ \
+GPTQ=false \
+SMOOTHQUANT=false \
+AWQ=true \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-AWQ \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
-切换 HiF4 权重量化格式：
+### SmoothQuant
+
+SmoothQuant 需要关掉默认 AWQ：
+
+```bash
+AWQ=false \
+SMOOTHQUANT=true \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-SmoothQuant \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
+可调 SmoothQuant alpha：
+
+```bash
+AWQ=false \
+SMOOTHQUANT=true \
+SMOOTHQUANT_ALPHA=0.5 \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-SmoothQuant \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
+### FlatQuant
+
+FlatQuant 使用单独脚本：
+
+```bash
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-FlatQuant \
+bash HiFloat4/quantize_qwen3_5_27b_flatquant.sh
+```
+
+常用调试小样本：
+
+```bash
+CAL_NSAMPLES=4 \
+CAL_SEQLEN=512 \
+FLATQUANT_EPOCHS=1 \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-FlatQuant-debug \
+bash HiFloat4/quantize_qwen3_5_27b_flatquant.sh
+```
+
+注意：`CAL_NSAMPLES` 必须能被 `FLATQUANT_CALI_BSZ` 整除。脚本默认 `CAL_NSAMPLES=128`、`FLATQUANT_CALI_BSZ=4`。
+
+### hif4-1
+
+AWQ、SmoothQuant、FlatQuant 都支持切换到 `hif4-1`：
 
 ```bash
 HIF4_WEIGHT_FORMAT=hif4-1 \
-OUTPUT=/data/Qwen3.5-27B-HiF4-1-RTN \
+AWQ=false \
+SMOOTHQUANT=true \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-1-SmoothQuant \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
-保存成功后，输出目录应包含 `config.json`、`generation_config.json`、分片权重文件和 index 文件。中断或磁盘写满留下的目录不能当作可用 checkpoint。
+FlatQuant 的 `hif4-1`：
+
+```bash
+HIF4_WEIGHT_FORMAT=hif4-1 \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-1-FlatQuant \
+bash HiFloat4/quantize_qwen3_5_27b_flatquant.sh
+```
+
+保存成功后，输出目录应包含 `config.json`、`generation_config.json`、tokenizer 文件、分片权重文件和 index 文件。FlatQuant 目录还应包含 `flat_matrices.pth` 和 `hif4_flatquant_config.json`。中断或磁盘写满留下的目录不能当作可用 checkpoint。
+
+### 量化后评测
+
+AWQ 和 SmoothQuant 保存的是普通 Hugging Face 格式模型，用根目录评测入口即可：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
+  --model_path Qmodel/Qwen3.5-27b-Hif4-SmoothQuant \
+  --datasets gsm8k \
+  --tensor_parallel_size 4 \
+  --max_samples 16
+```
+
+FlatQuant 评测有一点不同：它需要注册 vLLM 自定义模型，并且当前只支持 `--tensor_parallel_size 1`。根目录 `main.py` 会在检测到模型目录里的 `hif4_flatquant_config.json` 后自动注册：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --model_path Qmodel/Qwen3.5-27b-Hif4-FlatQuant \
+  --datasets gsm8k \
+  --tensor_parallel_size 1 \
+  --max_samples 16
+```
+
+FlatQuant 的激活量化已经保存在模型结构里，评测时不要额外加 `--fake_act_quant hif4` 或 `--fake_act_quant hif4-1`。
 
 ## 自定义任务
 
