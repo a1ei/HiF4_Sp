@@ -144,7 +144,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
 conda activate hif4
 ```
 
-下面的脚本参数里很多名字带 `GPTQ`，例如 `GPTQ_CAL_DATASET`、`GPTQ_CAL_NSAMPLES`、`GPTQ_CAL_SEQLEN`，以及 Python 参数 `--gptq_cal_dataset`、`--gptq_cal_nsamples`、`--gptq_cal_seqlen`、`--gptq_save_path`。这些名字是历史原因保留下来的，不只给 GPTQ 用；AWQ、SmoothQuant、FlatQuant 也共用这些校准数据和保存路径参数。
+下面的脚本参数里很多名字带 `GPTQ`，例如 `GPTQ_CAL_DATASET`、`GPTQ_CAL_NSAMPLES`、`GPTQ_CAL_SEQLEN`，以及 Python 参数 `--gptq_cal_dataset`、`--gptq_cal_nsamples`、`--gptq_cal_seqlen`、`--gptq_save_path`。这些名字是历史原因保留下来的，不只给 GPTQ 用；AWQ、SmoothQuant、MagR、FlatQuant 也共用这些校准数据和保存路径参数。
 
 ### AWQ
 
@@ -186,6 +186,29 @@ OUTPUT=Qmodel/Qwen3.5-27b-Hif4-SmoothQuant \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
+### MagR
+
+MagR 需要关掉默认 AWQ：
+
+```bash
+AWQ=false \
+MAGR=true \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-MagR \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
+常用调试小样本：
+
+```bash
+AWQ=false \
+MAGR=true \
+GPTQ_CAL_NSAMPLES=4 \
+GPTQ_CAL_SEQLEN=512 \
+MAGR_PREPROCESS_ITER=1 \
+OUTPUT=Qmodel/Qwen3.5-27b-Hif4-MagR-debug \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
 ### FlatQuant
 
 FlatQuant 使用单独脚本：
@@ -209,7 +232,7 @@ bash HiFloat4/quantize_qwen3_5_27b_flatquant.sh
 
 ### hif4-1
 
-AWQ、SmoothQuant、FlatQuant 都支持切换到 `hif4-1`：
+AWQ、SmoothQuant、MagR、FlatQuant 都支持切换到 `hif4-1`：
 
 ```bash
 HIF4_WEIGHT_FORMAT=hif4-1 \
@@ -231,7 +254,7 @@ bash HiFloat4/quantize_qwen3_5_27b_flatquant.sh
 
 ### 量化后评测
 
-AWQ 和 SmoothQuant 保存的是普通 Hugging Face 格式模型，用根目录评测入口即可：
+AWQ、SmoothQuant、MagR 保存的是普通 Hugging Face 格式模型，用根目录评测入口即可：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \

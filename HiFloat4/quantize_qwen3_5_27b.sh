@@ -15,16 +15,21 @@ OUTPUT="${OUTPUT:-Qmodel/Qwen3.5-27b-Hif4-AWQ}"
 GPTQ="${GPTQ:-false}"
 SMOOTHQUANT="${SMOOTHQUANT:-false}"
 AWQ="${AWQ:-true}"
+MAGR="${MAGR:-false}"
 DTYPE="${DTYPE:-float16}"
 #虽然参数开头是GPTQ，但实际上是用于所有量化方法的校准数据集、样本数和序列长度
 GPTQ_CAL_DATASET="${GPTQ_CAL_DATASET:-c4}"
 GPTQ_CAL_NSAMPLES="${GPTQ_CAL_NSAMPLES:-512}"
 GPTQ_CAL_SEQLEN="${GPTQ_CAL_SEQLEN:-512}"
 GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
-BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}"
+BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}" #magr中 -1是per_layer
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
 SMOOTHQUANT_ALPHA="${SMOOTHQUANT_ALPHA:-0.5}"
 AWQ_N_GRID="${AWQ_N_GRID:-20}"
+MAGR_CD_ITER="${MAGR_CD_ITER:-1}"
+MAGR_ALPHA="${MAGR_ALPHA:-0.001}"
+MAGR_ALPHA_GROUPWISE="${MAGR_ALPHA_GROUPWISE:-0.0001}"
+MAGR_PREPROCESS_ITER="${MAGR_PREPROCESS_ITER:-200}"
 
 cd "${REPO_ROOT}"
 
@@ -53,6 +58,7 @@ python HiFloat4/main.py \
   --gptq "${GPTQ}" \
   --smoothquant "${SMOOTHQUANT}" \
   --awq "${AWQ}" \
+  --magr "${MAGR}" \
   --gptq_save_path "${OUTPUT}" \
   --gptq_cal_dataset "${GPTQ_CAL_DATASET}" \
   --gptq_cal_nsamples "${GPTQ_CAL_NSAMPLES}" \
@@ -61,4 +67,8 @@ python HiFloat4/main.py \
   --block_size_linear "${BLOCK_SIZE_LINEAR}" \
   --smoothquant_alpha "${SMOOTHQUANT_ALPHA}" \
   --awq_n_grid "${AWQ_N_GRID}" \
+  --magr_cd_iter "${MAGR_CD_ITER}" \
+  --magr_alpha "${MAGR_ALPHA}" \
+  --magr_alpha_groupwise "${MAGR_ALPHA_GROUPWISE}" \
+  --magr_preprocess_iter "${MAGR_PREPROCESS_ITER}" \
   "$@"

@@ -327,6 +327,11 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument("--smoothquant_alpha", type=float, default=0.5)
     parser.add_argument("--awq", type=str2bool, default=False)
     parser.add_argument("--awq_n_grid", type=int, default=20)
+    parser.add_argument("--magr", type=str2bool, default=False)
+    parser.add_argument("--magr_cd_iter", type=int, default=1)
+    parser.add_argument("--magr_alpha", type=float, default=0.001)
+    parser.add_argument("--magr_alpha_groupwise", type=float, default=0.0001)
+    parser.add_argument("--magr_preprocess_iter", type=int, default=200)
     parser.add_argument("--flatquant", type=str2bool, default=False)
     parser.add_argument("--flatquant_epochs", type=int, default=15)
     parser.add_argument("--flatquant_cali_bsz", type=int, default=1)
@@ -351,15 +356,15 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
     logger.info("Running with args: %s", vars(args))
     set_seed(args.seed)
     args.hif4_weight_qtype = _hif4_weight_qtype(args.hif4_weight_format)
-    if args.hif4_weight_qtype == "hifx4_1" and args.gptq and args.block_size_linear != 64:
-        raise ValueError("hif4-1 GPTQ requires --block_size_linear 64.")
-    enabled_weight_methods = sum(bool(x) for x in (args.gptq, args.smoothquant, args.awq, args.flatquant))
+    if args.hif4_weight_qtype == "hifx4_1" and (args.gptq or args.magr) and args.block_size_linear != 64:
+        raise ValueError("hif4-1 GPTQ/MagR requires --block_size_linear 64.")
+    enabled_weight_methods = sum(bool(x) for x in (args.gptq, args.smoothquant, args.awq, args.magr, args.flatquant))
     if enabled_weight_methods > 1:
-        raise ValueError("--gptq, --smoothquant, --awq, and --flatquant cannot be enabled at the same time.")
+        raise ValueError("--gptq, --smoothquant, --awq, --magr, and --flatquant cannot be enabled at the same time.")
 
     dtype = _torch_dtype_from_arg(args.dtype)
     load_device_map = "cpu"
-    if args.hif4w and not args.gptq and not args.smoothquant and not args.awq and not args.flatquant:
+    if args.hif4w and not args.gptq and not args.smoothquant and not args.awq and not args.magr and not args.flatquant:
         quant_device = _quant_device()
         if quant_device.type != "cuda":
             raise RuntimeError("HiF4 RTN quantization requires CUDA.")
@@ -434,6 +439,25 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
             eval_mode=False,
         )
         awq_utils.awq_fwrd(model, trainloader, _quant_device(), args)
+
+        if args.gptq_save_path:
+            _save_quantized_model(model, args.gptq_save_path, tokenizer)
+    elif args.magr:
+        if args.hif4w:
+            logger.info("Both --hif4w and --magr are enabled; MagR controls weight quantization and HiF4 RTN is skipped.")
+
+        from hif4magr import magr_fwrd
+        import brq.calib as calib
+
+        logger.info("Quantizing model weights with HiFloat4 MagR.")
+        trainloader = calib.get_loaders(
+            args.gptq_cal_dataset,
+            nsamples=args.gptq_cal_nsamples,
+            seqlen=args.gptq_cal_seqlen,
+            model=args.model,
+            eval_mode=False,
+        )
+        magr_fwrd(model, trainloader, _quant_device(), args)
 
         if args.gptq_save_path:
             _save_quantized_model(model, args.gptq_save_path, tokenizer)
