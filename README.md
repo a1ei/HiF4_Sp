@@ -144,7 +144,28 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main.py \
 conda activate hif4
 ```
 
-下面的脚本参数里很多名字带 `GPTQ`，例如 `GPTQ_CAL_DATASET`、`GPTQ_CAL_NSAMPLES`、`GPTQ_CAL_SEQLEN`，以及 Python 参数 `--gptq_cal_dataset`、`--gptq_cal_nsamples`、`--gptq_cal_seqlen`、`--gptq_save_path`。这些名字是历史原因保留下来的，不只给 GPTQ 用；AWQ、SmoothQuant、MagR、FlatQuant 也共用这些校准数据和保存路径参数。
+AWQ、SmoothQuant、MagR、GPTQ、FlatQuant 共用 `CAL_DATASET`、`CAL_NSAMPLES`、`CAL_SEQLEN`、`CAL_SLICE_MODE` 和 `CAL_SLICE_OFFSET` 校准参数。对应的 Python 参数统一以 `--cal_` 开头。
+
+校准数据集支持 `wikitext2`、`ptb`、`c4` 和 `s1k-1.1`。`s1k-1.1` 按 `question + deepseek_thinking_trajectory + deepseek_attempt` 的顺序用两个换行连接，再在完整序列内选择切片位置。数据集的 `solution` 只是很短的标准答案，不作为 s1.1 推理轨迹使用。这样 `head` 通常包含 problem，`tail` 通常只包含 DeepSeek 推理或回答后段，可直接比较 problem 是否改善校准效果：
+
+- `CAL_SLICE_MODE=random`：随机切片。
+- `CAL_SLICE_MODE=head`：取前 `CAL_SEQLEN` 个 token。
+- `CAL_SLICE_MODE=tail`：取后 `CAL_SEQLEN` 个 token。
+- `CAL_SLICE_MODE=offset`：从 `CAL_SLICE_OFFSET` 指定的 token 下标开始切片。
+
+长度不足 `CAL_SEQLEN` 的样本会被跳过，并继续从剩余数据中选择；只有整个数据集都无法凑够 `CAL_NSAMPLES` 时才报错。
+
+例如分别使用前、后 2048 个 token：
+
+```bash
+CAL_DATASET=s1k-1.1 CAL_SEQLEN=2048 CAL_SLICE_MODE=head \
+OUTPUT=Qmodel/Qwen3.5-27B-HiF4-s1k-head-2048 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+
+CAL_DATASET=s1k-1.1 CAL_SEQLEN=2048 CAL_SLICE_MODE=tail \
+OUTPUT=Qmodel/Qwen3.5-27B-HiF4-s1k-tail-2048 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
 
 ### AWQ
 
@@ -202,8 +223,8 @@ bash HiFloat4/quantize_qwen3_5_27b.sh
 ```bash
 AWQ=false \
 MAGR=true \
-GPTQ_CAL_NSAMPLES=4 \
-GPTQ_CAL_SEQLEN=512 \
+CAL_NSAMPLES=4 \
+CAL_SEQLEN=512 \
 MAGR_PREPROCESS_ITER=1 \
 OUTPUT=Qmodel/Qwen3.5-27b-Hif4-MagR-debug \
 bash HiFloat4/quantize_qwen3_5_27b.sh

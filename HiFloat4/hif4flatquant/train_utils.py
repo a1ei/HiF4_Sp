@@ -46,9 +46,9 @@ def _capture_first_layer_inputs(model, dataloader, device, args):
         model.model.rotary_emb = model.model.rotary_emb.to(device)
     layers[0] = layers[0].to(device)
     dtype = next(iter(model.parameters())).dtype
-    max_samples = args.gptq_cal_nsamples
+    max_samples = args.cal_nsamples
     inps = torch.zeros(
-        (max_samples, args.gptq_cal_seqlen, model.config.hidden_size),
+        (max_samples, args.cal_seqlen, model.config.hidden_size),
         dtype=dtype,
         device=device,
     )
@@ -126,7 +126,7 @@ def _save_flat_parameters(model, path, upto):
 def cali_flat_quant(args, model, dataloader, device):
     layers, fp_inps, layer_kwargs, nsamples = _capture_first_layer_inputs(model, dataloader, device, args)
     if nsamples % args.flatquant_cali_bsz != 0:
-        raise ValueError("--gptq_cal_nsamples must be divisible by --flatquant_cali_bsz.")
+        raise ValueError("--cal_nsamples must be divisible by --flatquant_cali_bsz.")
     fp_outs = torch.zeros_like(fp_inps)
     steps_per_epoch = nsamples // args.flatquant_cali_bsz
     loss_func = nn.MSELoss()

@@ -36,7 +36,7 @@ from lighteval.tasks.requests import Doc
 
 
 TEMPLATE = """
-Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
+Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of {answer_letters}. Think step by step before answering.
 
 {question}
 
@@ -46,17 +46,24 @@ Answer:""".strip()
 
 
 def mmlu_pro_prompt_function(line, task_name: str = None):
-    choices = "\n".join([f"{letter}: {choice}" for letter, choice in zip(ascii_uppercase, line["options"])])
+    options = line["options"]
+    if not 2 <= len(options) <= len(ascii_uppercase):
+        raise ValueError(f"MMLU-Pro requires 2 to 26 options, got {len(options)}.")
+    answer_letters = ascii_uppercase[: len(options)]
+    formatted_choices = "\n".join(
+        f"{letter}: {option}" for letter, option in zip(answer_letters, options)
+    )
 
     query = TEMPLATE.format(
         question=line["question"],
-        choices=choices,
+        choices=formatted_choices,
+        answer_letters=", ".join(answer_letters),
     )
 
     return Doc(
         task_name=task_name,
         query=query,
-        choices=ascii_uppercase[: len(choices)],
+        choices=list(answer_letters),
         gold_index=line["answer_index"],
         instruction=query,
     )
@@ -78,6 +85,7 @@ mmlu_pro = LightevalTaskConfig(
     evaluation_splits=("test",),
     few_shots_split="validation",
     metrics=[Metrics.gpqa_instruct_metric],
+    version=1,
 )
 
 TASKS_TABLE = [mmlu_pro]

@@ -246,11 +246,11 @@ def magr_fwrd(model, dataloader, dev, args):
     layers[0] = layers[0].to(device)
 
     dtype = next(iter(model.parameters())).dtype
-    max_samples = args.cal_nsamples
+    max_samples = args.gptq_cal_nsamples
     inps = torch.zeros(
-        (max_samples, args.cal_seqlen, model.config.hidden_size),
+        (max_samples, args.gptq_cal_seqlen, model.config.hidden_size),
         dtype=dtype,
-        device="cpu",
+        device=device,
     )
     cache = {"i": 0}
 
@@ -262,7 +262,7 @@ def magr_fwrd(model, dataloader, dev, args):
         def forward(self, inp, **kwargs):
             idx = cache["i"]
             if idx < max_samples:
-                inps[idx].copy_(inp[0].detach().cpu())
+                inps[idx] = inp
             cache["i"] += 1
             for key, val in kwargs.items():
                 cache[key] = val
@@ -343,11 +343,11 @@ def magr_fwrd(model, dataloader, dev, args):
             handles = [subset[name].register_forward_hook(add_batch(name)) for name in magr_blocks]
 
             for j in range(nsamples):
-                layer_input = inps[j].unsqueeze(0).to(device)
+                layer_input = inps[j].unsqueeze(0)
                 current_layer_kwargs = _layer_kwargs_for_current_layer(
                     model, layer, layer_input, layer_kwargs
                 )
-                outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
+                outs[j] = _run_layer(layer, layer_input, current_layer_kwargs)
 
             for handle in handles:
                 handle.remove()
@@ -366,11 +366,11 @@ def magr_fwrd(model, dataloader, dev, args):
                 block.free()
 
         for j in range(nsamples):
-            layer_input = inps[j].unsqueeze(0).to(device)
+            layer_input = inps[j].unsqueeze(0)
             current_layer_kwargs = _layer_kwargs_for_current_layer(
                 model, layer, layer_input, layer_kwargs
             )
-            outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
+            outs[j] = _run_layer(layer, layer_input, current_layer_kwargs)
 
         layers[i] = layer.cpu()
         del layer

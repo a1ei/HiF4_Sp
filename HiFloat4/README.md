@@ -76,9 +76,11 @@ python HiFloat4/main.py \
   --hif4_weight_format "${HIF4_WEIGHT_FORMAT}" \
   --gptq "${GPTQ}" \
   --gptq_save_path "${OUTPUT}" \
-  --gptq_cal_dataset "${GPTQ_CAL_DATASET}" \
-  --gptq_cal_nsamples "${GPTQ_CAL_NSAMPLES}" \
-  --gptq_cal_seqlen "${GPTQ_CAL_SEQLEN}" \
+  --cal_dataset "${CAL_DATASET}" \
+  --cal_nsamples "${CAL_NSAMPLES}" \
+  --cal_seqlen "${CAL_SEQLEN}" \
+  --cal_slice_mode "${CAL_SLICE_MODE}" \
+  --cal_slice_offset "${CAL_SLICE_OFFSET}" \
   --gptq_percdamp "${GPTQ_PERCDAMP}" \
   --block_size_linear "${BLOCK_SIZE_LINEAR}"
 ```
@@ -100,12 +102,26 @@ HIF4_WEIGHT_FORMAT=hif4-1 OUTPUT=/data/Qwen3.5-27B-HiF4-1-RTN bash HiFloat4/quan
 
 # 使用 GPTQ 路径
 GPTQ=true \
-GPTQ_CAL_DATASET=c4 \
-GPTQ_CAL_NSAMPLES=512 \
-GPTQ_CAL_SEQLEN=512 \
+CAL_DATASET=c4 \
+CAL_NSAMPLES=512 \
+CAL_SEQLEN=512 \
 OUTPUT=/data/Qwen3.5-27B-HiF4-GPTQ \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
+
+使用 s1K-1.1 `question + deepseek_thinking_trajectory + deepseek_attempt` 完整序列的前或后 2048 个 token：
+
+```bash
+CAL_DATASET=s1k-1.1 CAL_SEQLEN=2048 CAL_SLICE_MODE=head \
+OUTPUT=/data/Qwen3.5-27B-HiF4-s1k-head-2048 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+
+CAL_DATASET=s1k-1.1 CAL_SEQLEN=2048 CAL_SLICE_MODE=tail \
+OUTPUT=/data/Qwen3.5-27B-HiF4-s1k-tail-2048 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
+长度不足的样本会被跳过，并继续选择后续样本；整个数据集无法凑够要求的样本数时才报错。
 
 保存成功后，输出目录应包含：
 

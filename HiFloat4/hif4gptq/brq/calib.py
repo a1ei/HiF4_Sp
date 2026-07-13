@@ -92,6 +92,87 @@ def get_c4(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
     return trainloader
 
 
+def get_s1k_1_1(
+    nsamples,
+    seed,
+    seqlen,
+    model,
+    hf_token=None,
+    eval_mode=False,
+    slice_mode="random",
+    slice_offset=0,
+):
+    if eval_mode:
+        raise ValueError("s1k-1.1 only supports calibration mode; it has no evaluation split here.")
+    if nsamples <= 0:
+        raise ValueError("cal_nsamples must be greater than 0.")
+    if seqlen <= 0:
+        raise ValueError("cal_seqlen must be greater than 0.")
+    if slice_mode not in {"random", "head", "tail", "offset"}:
+        raise ValueError(f"Unsupported calibration slice mode: {slice_mode}")
+    if slice_offset < 0:
+        raise ValueError("cal_slice_offset must be greater than or equal to 0.")
+    if slice_mode != "offset" and slice_offset != 0:
+        raise ValueError("cal_slice_offset can only be non-zero when cal_slice_mode=offset.")
+
+    tokenizer = _get_tokenizer(model, hf_token)
+    train_data = load_dataset("simplescaling/s1K-1.1", split="train")
+    rng = random.Random(seed)
+    indices = list(range(len(train_data)))
+    rng.shuffle(indices)
+
+    trainloader = []
+    for idx in indices:
+        question = train_data[idx].get("question")
+        thinking_trajectory = train_data[idx].get("deepseek_thinking_trajectory")
+        attempt = train_data[idx].get("deepseek_attempt")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(f"s1k-1.1 sample {idx} has an empty or invalid question field.")
+        if not isinstance(thinking_trajectory, str) or not thinking_trajectory.strip():
+            raise ValueError(
+                f"s1k-1.1 sample {idx} has an empty or invalid deepseek_thinking_trajectory field."
+            )
+        if not isinstance(attempt, str) or not attempt.strip():
+            raise ValueError(f"s1k-1.1 sample {idx} has an empty or invalid deepseek_attempt field.")
+
+        calibration_text = f"{question}\n\n{thinking_trajectory}\n\n{attempt}"
+        input_ids = tokenizer(
+            calibration_text,
+            return_tensors="pt",
+            add_special_tokens=False,
+        ).input_ids
+        token_count = input_ids.shape[1]
+        required_tokens = slice_offset + seqlen if slice_mode == "offset" else seqlen
+        if token_count < required_tokens:
+            continue
+
+        if slice_mode == "head":
+            start = 0
+        elif slice_mode == "tail":
+            start = token_count - seqlen
+        elif slice_mode == "offset":
+            start = slice_offset
+        else:
+            start = rng.randint(0, token_count - seqlen)
+
+        inp = input_ids[:, start : start + seqlen]
+        if inp.shape != (1, seqlen):
+            raise RuntimeError(
+                f"s1k-1.1 sample {idx} produced invalid calibration shape {tuple(inp.shape)}."
+            )
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+        if len(trainloader) == nsamples:
+            return trainloader
+
+    raise ValueError(
+        "s1k-1.1 does not contain enough eligible samples: "
+        f"requested={nsamples}, collected={len(trainloader)}, seqlen={seqlen}, "
+        f"slice_mode={slice_mode}, slice_offset={slice_offset}."
+    )
+
+
 def get_wikitext2_test(seed, seqlen, model):
     del seed
     test_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -100,7 +181,30 @@ def get_wikitext2_test(seed, seqlen, model):
     return testenc
 
 
-def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model="", hf_token=None, eval_mode=False):
+def get_loaders(
+    name,
+    nsamples=128,
+    seed=0,
+    seqlen=2048,
+    model="",
+    hf_token=None,
+    eval_mode=False,
+    slice_mode="random",
+    slice_offset=0,
+):
+    if name == "s1k-1.1":
+        return get_s1k_1_1(
+            nsamples,
+            seed,
+            seqlen,
+            model,
+            hf_token,
+            eval_mode,
+            slice_mode,
+            slice_offset,
+        )
+    if slice_mode != "random" or slice_offset != 0:
+        raise ValueError("Calibration slice controls currently only support cal_dataset=s1k-1.1.")
     if "wikitext2" in name:
         return get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode)
     if "ptb" in name:

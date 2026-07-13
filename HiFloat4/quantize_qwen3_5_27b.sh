@@ -17,16 +17,23 @@ SMOOTHQUANT="${SMOOTHQUANT:-false}"
 AWQ="${AWQ:-true}"
 MAGR="${MAGR:-false}"
 DTYPE="${DTYPE:-float16}"
-#虽然参数开头是GPTQ，但实际上是用于所有量化方法的校准数据集、样本数和序列长度
-GPTQ_CAL_DATASET="${GPTQ_CAL_DATASET:-c4}"
-GPTQ_CAL_NSAMPLES="${GPTQ_CAL_NSAMPLES:-512}"
-GPTQ_CAL_SEQLEN="${GPTQ_CAL_SEQLEN:-512}"
+CAL_DATASET="${CAL_DATASET:-c4}"
+CAL_NSAMPLES="${CAL_NSAMPLES:-512}"
+CAL_SEQLEN="${CAL_SEQLEN:-512}"
+CAL_SLICE_MODE="${CAL_SLICE_MODE:-random}"
+CAL_SLICE_OFFSET="${CAL_SLICE_OFFSET:-0}"
 GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
 BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}" #magr中 -1是per_layer
+TOKEN_IMPORTANCE="${TOKEN_IMPORTANCE:-none}"
+ENTROPY_ALPHA="${ENTROPY_ALPHA:-1.0}"
+ENTROPY_NORM="${ENTROPY_NORM:-minmax}"
+IMPORTANCE_ALPHA="${IMPORTANCE_ALPHA:-1.0}"
+IMPORTANCE_MEAN_NORMALIZE="${IMPORTANCE_MEAN_NORMALIZE:-true}"
+IMPORTANCE_BATCH_SIZE="${IMPORTANCE_BATCH_SIZE:-1}"
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
 SMOOTHQUANT_ALPHA="${SMOOTHQUANT_ALPHA:-0.5}"
 AWQ_N_GRID="${AWQ_N_GRID:-20}"
-MAGR_CD_ITER="${MAGR_CD_ITER:-1}"
+MAGR_CD_ITER="${MAGR_CD_ITER:-3}"
 MAGR_ALPHA="${MAGR_ALPHA:-0.001}"
 MAGR_ALPHA_GROUPWISE="${MAGR_ALPHA_GROUPWISE:-0.0001}"
 MAGR_PREPROCESS_ITER="${MAGR_PREPROCESS_ITER:-200}"
@@ -60,11 +67,19 @@ python HiFloat4/main.py \
   --awq "${AWQ}" \
   --magr "${MAGR}" \
   --gptq_save_path "${OUTPUT}" \
-  --gptq_cal_dataset "${GPTQ_CAL_DATASET}" \
-  --gptq_cal_nsamples "${GPTQ_CAL_NSAMPLES}" \
-  --gptq_cal_seqlen "${GPTQ_CAL_SEQLEN}" \
+  --cal_dataset "${CAL_DATASET}" \
+  --cal_nsamples "${CAL_NSAMPLES}" \
+  --cal_seqlen "${CAL_SEQLEN}" \
+  --cal_slice_mode "${CAL_SLICE_MODE}" \
+  --cal_slice_offset "${CAL_SLICE_OFFSET}" \
   --gptq_percdamp "${GPTQ_PERCDAMP}" \
   --block_size_linear "${BLOCK_SIZE_LINEAR}" \
+  --token_importance "${TOKEN_IMPORTANCE}" \
+  --entropy_alpha "${ENTROPY_ALPHA}" \
+  --entropy_norm "${ENTROPY_NORM}" \
+  --importance_alpha "${IMPORTANCE_ALPHA}" \
+  --importance_mean_normalize "${IMPORTANCE_MEAN_NORMALIZE}" \
+  --importance_batch_size "${IMPORTANCE_BATCH_SIZE}" \
   --smoothquant_alpha "${SMOOTHQUANT_ALPHA}" \
   --awq_n_grid "${AWQ_N_GRID}" \
   --magr_cd_iter "${MAGR_CD_ITER}" \

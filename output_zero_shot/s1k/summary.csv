@@ -1,0 +1,5 @@
+model,cal_slice,cal_nsamples,cal_seqlen,arc_easy_acc,arc_challenge_acc,arc_average_acc,aime25_run_1,aime25_run_2,aime25_run_3,aime25_run_4,aime25_mean,aime25_sample_std
+Qwen3.5-27B-HiF4-GPTQ_s1k_head_512_512,head,512,512,0.5631,0.4480,0.5055,0.8333,0.8000,0.8667,0.8667,0.8417,0.0319
+Qwen3.5-27B-HiF4-GPTQ_s1k_head_512_1536,head,512,1536,0.5446,0.4386,0.4916,0.9000,0.8667,0.8667,0.8000,0.8584,0.0419
+Qwen3.5-27B-HiF4-GPTQ_s1k_tail_512_512,tail,512,512,0.5581,0.4573,0.5077,0.9000,0.8667,0.8667,0.9333,0.8917,0.0319
+Qwen3.5-27B-HiF4-GPTQ_s1k_tail_512_1536,tail,512,1536,0.5539,0.4428,0.4984,0.7667,0.9000,0.8667,0.9000,0.8584,0.0631

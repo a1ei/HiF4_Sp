@@ -68,9 +68,9 @@ def _capture_first_layer_inputs(model, dataloader, device: torch.device, args):
     layers[0] = layers[0].to(device)
 
     dtype = next(iter(model.parameters())).dtype
-    max_samples = args.gptq_cal_nsamples
+    max_samples = args.cal_nsamples
     inps = torch.zeros(
-        (max_samples, args.gptq_cal_seqlen, model.config.hidden_size),
+        (max_samples, args.cal_seqlen, model.config.hidden_size),
         dtype=dtype,
         device=device,
     )

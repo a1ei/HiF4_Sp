@@ -108,11 +108,14 @@ def _no_split_module_classes(model):
     return mapping.get(model_type, ["LlamaDecoderLayer", "Qwen3DecoderLayer", "Qwen3_5DecoderLayer"])
 
 
-def _save_quantized_model(model, path: str, tokenizer=None) -> None:
+def _save_quantized_model(model, path: str, tokenizer=None, args=None) -> None:
     os.makedirs(path, exist_ok=True)
     model.save_pretrained(path, safe_serialization=False, max_shard_size="5GB")
     if tokenizer is not None:
         tokenizer.save_pretrained(path)
+    if args is not None:
+        with open(os.path.join(path, "quantization_args.json"), "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2, sort_keys=True, ensure_ascii=False, default=str)
     logging.info("Saved quantized model to %s", path)
 
 
@@ -313,16 +316,51 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument("--gptq", type=str2bool, default=False)
     parser.add_argument("--gptq_percdamp", type=float, default=0.01)
     parser.add_argument(
-        "--gptq_cal_dataset",
+        "--cal_dataset",
         type=str,
         default="c4",
-        choices=["wikitext2", "ptb", "c4"],
+        choices=["wikitext2", "ptb", "c4", "s1k-1.1"],
     )
-    parser.add_argument("--gptq_cal_nsamples", type=int, default=512)
-    parser.add_argument("--gptq_cal_seqlen", type=int, default=512)
+    parser.add_argument("--cal_nsamples", type=int, default=512)
+    parser.add_argument("--cal_seqlen", type=int, default=512)
+    parser.add_argument(
+        "--cal_slice_mode",
+        type=str,
+        default="random",
+        choices=["random", "head", "tail", "offset"],
+        help="s1k-1.1 calibration slice mode within each question-plus-DeepSeek-response sequence.",
+    )
+    parser.add_argument(
+        "--cal_slice_offset",
+        type=int,
+        default=0,
+        help="Zero-based token offset used only when --cal_slice_mode=offset.",
+    )
     parser.add_argument("--gptq_load_path", type=str2path, default=None)
     parser.add_argument("--gptq_save_path", type=str2path, default=None)
     parser.add_argument("--block_size_linear", type=int, default=64)
+    parser.add_argument(
+        "--token_importance",
+        type=str,
+        default="none",
+        choices=["none", "entropy", "entropy_grad"],
+        help="Optional GPTQ token-level Hessian weighting method.",
+    )
+    parser.add_argument("--entropy_alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--entropy_norm",
+        type=str,
+        default="minmax",
+        choices=["minmax", "zscore", "mean"],
+    )
+    parser.add_argument("--importance_alpha", type=float, default=1.0)
+    parser.add_argument("--importance_mean_normalize", type=str2bool, default=True)
+    parser.add_argument(
+        "--importance_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for the entropy_grad FP attribution pass.",
+    )
     parser.add_argument("--smoothquant", type=str2bool, default=False)
     parser.add_argument("--smoothquant_alpha", type=float, default=0.5)
     parser.add_argument("--awq", type=str2bool, default=False)
@@ -361,6 +399,34 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
     enabled_weight_methods = sum(bool(x) for x in (args.gptq, args.smoothquant, args.awq, args.magr, args.flatquant))
     if enabled_weight_methods > 1:
         raise ValueError("--gptq, --smoothquant, --awq, --magr, and --flatquant cannot be enabled at the same time.")
+    if args.entropy_alpha < 0:
+        raise ValueError("--entropy_alpha must be greater than or equal to 0.")
+    if args.importance_alpha < 0:
+        raise ValueError("--importance_alpha must be greater than or equal to 0.")
+    if args.importance_batch_size <= 0:
+        raise ValueError("--importance_batch_size must be greater than 0.")
+    if args.token_importance != "none" and (not args.gptq or args.gptq_load_path):
+        raise ValueError("--token_importance is only supported when running new GPTQ quantization.")
+    needs_calibration = (args.gptq and not args.gptq_load_path) or any(
+        (args.smoothquant, args.awq, args.magr, args.flatquant)
+    )
+    if needs_calibration:
+        if args.cal_nsamples <= 0:
+            raise ValueError("--cal_nsamples must be greater than 0.")
+        if args.cal_seqlen <= 0:
+            raise ValueError("--cal_seqlen must be greater than 0.")
+        if args.token_importance in {"entropy", "entropy_grad"} and args.cal_seqlen < 2:
+            raise ValueError("Entropy-based token importance requires --cal_seqlen to be at least 2.")
+        if args.cal_slice_offset < 0:
+            raise ValueError("--cal_slice_offset must be greater than or equal to 0.")
+        if args.cal_slice_mode != "offset" and args.cal_slice_offset != 0:
+            raise ValueError("--cal_slice_offset can only be non-zero when --cal_slice_mode=offset.")
+        if args.cal_dataset != "s1k-1.1" and (
+            args.cal_slice_mode != "random" or args.cal_slice_offset != 0
+        ):
+            raise ValueError("Calibration slice controls currently only support --cal_dataset=s1k-1.1.")
+        if args.flatquant and args.cal_nsamples % args.flatquant_cali_bsz != 0:
+            raise ValueError("--cal_nsamples must be divisible by --flatquant_cali_bsz.")
 
     dtype = _torch_dtype_from_arg(args.dtype)
     load_device_map = "cpu"
@@ -394,16 +460,18 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
             logger.info("Quantizing model weights with HiFloat4 GPTQ.")
             trainloader = calib.get_loaders(
-                args.gptq_cal_dataset,
-                nsamples=args.gptq_cal_nsamples,
-                seqlen=args.gptq_cal_seqlen,
+                args.cal_dataset,
+                nsamples=args.cal_nsamples,
+                seqlen=args.cal_seqlen,
                 model=args.model,
                 eval_mode=False,
+                slice_mode=args.cal_slice_mode,
+                slice_offset=args.cal_slice_offset,
             )
             gptq_utils.gptq_fwrd(model, trainloader, _quant_device(), args)
 
         if args.gptq_save_path:
-            _save_quantized_model(model, args.gptq_save_path)
+            _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
     elif args.smoothquant:
         if args.hif4w:
             logger.info("Both --hif4w and --smoothquant are enabled; SmoothQuant controls weight quantization and HiF4 RTN is skipped.")
@@ -413,16 +481,18 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
         logger.info("Quantizing model weights with HiFloat4 SmoothQuant.")
         trainloader = calib.get_loaders(
-            args.gptq_cal_dataset,
-            nsamples=args.gptq_cal_nsamples,
-            seqlen=args.gptq_cal_seqlen,
+            args.cal_dataset,
+            nsamples=args.cal_nsamples,
+            seqlen=args.cal_seqlen,
             model=args.model,
             eval_mode=False,
+            slice_mode=args.cal_slice_mode,
+            slice_offset=args.cal_slice_offset,
         )
         smoothquant_utils.smoothquant_fwrd(model, trainloader, _quant_device(), args)
 
         if args.gptq_save_path:
-            _save_quantized_model(model, args.gptq_save_path, tokenizer)
+            _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
     elif args.awq:
         if args.hif4w:
             logger.info("Both --hif4w and --awq are enabled; AWQ controls weight quantization and HiF4 RTN is skipped.")
@@ -432,16 +502,18 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
         logger.info("Quantizing model weights with HiFloat4 AWQ.")
         trainloader = calib.get_loaders(
-            args.gptq_cal_dataset,
-            nsamples=args.gptq_cal_nsamples,
-            seqlen=args.gptq_cal_seqlen,
+            args.cal_dataset,
+            nsamples=args.cal_nsamples,
+            seqlen=args.cal_seqlen,
             model=args.model,
             eval_mode=False,
+            slice_mode=args.cal_slice_mode,
+            slice_offset=args.cal_slice_offset,
         )
         awq_utils.awq_fwrd(model, trainloader, _quant_device(), args)
 
         if args.gptq_save_path:
-            _save_quantized_model(model, args.gptq_save_path, tokenizer)
+            _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
     elif args.magr:
         if args.hif4w:
             logger.info("Both --hif4w and --magr are enabled; MagR controls weight quantization and HiF4 RTN is skipped.")
@@ -451,16 +523,18 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
         logger.info("Quantizing model weights with HiFloat4 MagR.")
         trainloader = calib.get_loaders(
-            args.gptq_cal_dataset,
-            nsamples=args.gptq_cal_nsamples,
-            seqlen=args.gptq_cal_seqlen,
+            args.cal_dataset,
+            nsamples=args.cal_nsamples,
+            seqlen=args.cal_seqlen,
             model=args.model,
             eval_mode=False,
+            slice_mode=args.cal_slice_mode,
+            slice_offset=args.cal_slice_offset,
         )
         magr_fwrd(model, trainloader, _quant_device(), args)
 
         if args.gptq_save_path:
-            _save_quantized_model(model, args.gptq_save_path, tokenizer)
+            _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
     elif args.flatquant:
         if args.hif4w:
             logger.info("Both --hif4w and --flatquant are enabled; FlatQuant controls weight quantization and HiF4 RTN is skipped.")
@@ -470,11 +544,13 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
         logger.info("Quantizing model weights and Linear inputs with HiFloat4 FlatQuant.")
         trainloader = calib.get_loaders(
-            args.gptq_cal_dataset,
-            nsamples=args.gptq_cal_nsamples,
-            seqlen=args.gptq_cal_seqlen,
+            args.cal_dataset,
+            nsamples=args.cal_nsamples,
+            seqlen=args.cal_seqlen,
             model=args.model,
             eval_mode=False,
+            slice_mode=args.cal_slice_mode,
+            slice_offset=args.cal_slice_offset,
         )
         flatquant_fwrd(model, trainloader, _quant_device(), args)
         save_hif4_flatquant_model(model, tokenizer, args.gptq_save_path, args)
@@ -482,7 +558,7 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
         logger.info("Quantizing model weights with one-shot HiF4 RTN.")
         model = hif4_rtn_quant(model, args)
         if args.gptq_save_path:
-            _save_quantized_model(model, args.gptq_save_path)
+            _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
 
     if args.hif4a:
         logger.info("Replacing Linear layers with HiF4 activation-only QLinear2.")

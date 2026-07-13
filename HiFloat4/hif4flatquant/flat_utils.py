@@ -118,6 +118,11 @@ def _write_hif4_flatquant_config(args, path):
         json.dump(config, f, indent=2)
 
 
+def _write_quantization_args(args, path):
+    with open(os.path.join(path, "quantization_args.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+
+
 def save_hif4_flatquant_model(model, tokenizer, path, args):
     os.makedirs(path, exist_ok=True)
     matrices_path = os.path.join(path, "flat_matrices.pth")
@@ -133,4 +138,5 @@ def save_hif4_flatquant_model(model, tokenizer, path, args):
     model.config.save_pretrained(path)
     tokenizer.save_pretrained(path)
     _write_hif4_flatquant_config(args, path)
+    _write_quantization_args(args, path)
     logging.info("Saved HiF4 FlatQuant model to %s", path)

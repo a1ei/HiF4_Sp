@@ -108,13 +108,13 @@ echo "[install.sh] ==> 源码编译安装 vLLM v0.19.1 (editable, no build isola
 # git config --global http.lowSpeedLimit 0
 # git config --global http.lowSpeedTime 999999
 ########################################
-pushd "$REPO_ROOT/3rdparty/vllm" >/dev/null
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="0.19.1" \
-SETUPTOOLS_SCM_PRETEND_VERSION="0.19.1" \
-MAX_JOBS="${MAX_JOBS}" \
-CMAKE_ARGS="-DCUDAToolkit_ROOT=${CUDAToolkit_ROOT} -DCUDA_TOOLKIT_ROOT_DIR=${CUDAToolkit_ROOT} -DCUDA_INCLUDE_DIRS=${CUDAToolkit_ROOT}/include -DCUDA_CUDART_LIBRARY=${CUDAToolkit_ROOT}/lib/libcudart.so" \
-    pip install --editable . --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ --extra-index-url https://pypi.org/simple
-popd >/dev/null
+# pushd "$REPO_ROOT/3rdparty/vllm" >/dev/null
+# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM="0.19.1" \
+# SETUPTOOLS_SCM_PRETEND_VERSION="0.19.1" \
+# MAX_JOBS="${MAX_JOBS}" \
+# CMAKE_ARGS="-DCUDAToolkit_ROOT=${CUDAToolkit_ROOT} -DCUDA_TOOLKIT_ROOT_DIR=${CUDAToolkit_ROOT} -DCUDA_INCLUDE_DIRS=${CUDAToolkit_ROOT}/include -DCUDA_CUDART_LIBRARY=${CUDAToolkit_ROOT}/lib/libcudart.so" \
+#     pip install --editable . --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ --extra-index-url https://pypi.org/simple
+# popd >/dev/null
 
 # -------- 5. lighteval（editable, 不带 vllm extras） --------
 # lighteval[vllm] 会让 pip 重新解析并可能覆盖本地 editable vLLM；这里必须只装

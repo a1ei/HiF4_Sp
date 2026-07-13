@@ -17,6 +17,8 @@ HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
 CAL_DATASET="${CAL_DATASET:-c4}"
 CAL_NSAMPLES="${CAL_NSAMPLES:-128}"
 CAL_SEQLEN="${CAL_SEQLEN:-4096}"
+CAL_SLICE_MODE="${CAL_SLICE_MODE:-random}"
+CAL_SLICE_OFFSET="${CAL_SLICE_OFFSET:-0}"
 FLATQUANT_EPOCHS="${FLATQUANT_EPOCHS:-15}"
 FLATQUANT_CALI_BSZ="${FLATQUANT_CALI_BSZ:-4}"
 FLATQUANT_LR="${FLATQUANT_LR:-1e-5}"
@@ -37,9 +39,11 @@ python HiFloat4/main.py \
   --hif4_weight_format "${HIF4_WEIGHT_FORMAT}" \
   --flatquant true \
   --gptq_save_path "${OUTPUT}" \
-  --gptq_cal_dataset "${CAL_DATASET}" \
-  --gptq_cal_nsamples "${CAL_NSAMPLES}" \
-  --gptq_cal_seqlen "${CAL_SEQLEN}" \
+  --cal_dataset "${CAL_DATASET}" \
+  --cal_nsamples "${CAL_NSAMPLES}" \
+  --cal_seqlen "${CAL_SEQLEN}" \
+  --cal_slice_mode "${CAL_SLICE_MODE}" \
+  --cal_slice_offset "${CAL_SLICE_OFFSET}" \
   --flatquant_epochs "${FLATQUANT_EPOCHS}" \
   --flatquant_cali_bsz "${FLATQUANT_CALI_BSZ}" \
   --flatquant_lr "${FLATQUANT_LR}" \

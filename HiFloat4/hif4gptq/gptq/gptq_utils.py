@@ -137,6 +137,584 @@ def _layer_kwargs_for_current_layer(model, layer, hidden_states, base_layer_kwar
     return layer_kwargs
 
 
+def _capture_calibration_inputs(model, layers, dataloader, device, max_samples, seqlen, dtype):
+    if hasattr(model.model, "embed_tokens"):
+        model.model.embed_tokens = model.model.embed_tokens.to(device)
+    if hasattr(model.model, "norm"):
+        model.model.norm = model.model.norm.to(device)
+    if hasattr(model.model, "rotary_emb"):
+        model.model.rotary_emb = model.model.rotary_emb.to(device)
+    layers[0] = layers[0].to(device)
+
+    inps = torch.zeros((max_samples, seqlen, model.config.hidden_size), dtype=dtype, device="cpu")
+    valid_token_mask = torch.ones((max_samples, seqlen), dtype=torch.bool, device="cpu")
+    cache = {"i": 0}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            idx = cache["i"]
+            if idx < max_samples:
+                inps[idx].copy_(inp[0].detach().cpu())
+            cache["i"] += 1
+            for key, val in kwargs.items():
+                cache[key] = val
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        if cache["i"] >= max_samples:
+            break
+
+        if _is_qwen3_5_text_model(model):
+            _validate_no_padding_attention_mask(batch)
+
+        if isinstance(batch, (list, tuple)):
+            input_ids = batch[0]
+            attention_mask = None
+        elif isinstance(batch, dict):
+            input_ids = batch["input_ids"]
+            attention_mask = batch.get("attention_mask")
+        else:
+            input_ids = batch
+            attention_mask = None
+
+        if input_ids.shape[0] != 1 or input_ids.shape[1] != seqlen:
+            raise ValueError(
+                "GPTQ calibration currently requires batches shaped "
+                f"[1, {seqlen}], got {tuple(input_ids.shape)}."
+            )
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    "Calibration attention_mask must match input_ids shape, got "
+                    f"{tuple(attention_mask.shape)} and {tuple(input_ids.shape)}."
+                )
+            valid_token_mask[cache["i"]].copy_(attention_mask[0].detach().bool().cpu())
+
+        model_kwargs = {}
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.to(device)
+        try:
+            model(input_ids.to(device), **model_kwargs)
+        except ValueError:
+            pass
+
+    layers[0] = layers[0].module
+    nsamples = min(cache["i"], max_samples)
+    if nsamples == 0:
+        raise RuntimeError("Calibration dataloader produced zero samples.")
+
+    layers[0] = layers[0].cpu()
+    if hasattr(model.model, "embed_tokens"):
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+    if hasattr(model.model, "norm"):
+        model.model.norm = model.model.norm.cpu()
+    if hasattr(model.model, "rotary_emb"):
+        model.model.rotary_emb = model.model.rotary_emb.cpu()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    layer_kwargs = {k: v for k, v in cache.items() if k != "i"}
+    return inps[:nsamples], layer_kwargs, valid_token_mask[:nsamples]
+
+
+def _compute_fp_token_entropy(model, layers, inps, layer_kwargs, device, logits_chunk_size=128):
+    """Run a layer-wise FP forward and return next-token entropy on CPU."""
+    logging.info("Computing FP next-token entropy before GPTQ quantization.")
+    fp_inps = inps
+    fp_outs = torch.zeros_like(fp_inps)
+
+    for i in tqdm.tqdm(range(len(layers)), desc="(GPTQ Entropy FP) Layers"):
+        layer = layers[i].to(device)
+        for j in range(fp_inps.shape[0]):
+            layer_input = fp_inps[j].unsqueeze(0).to(device)
+            current_layer_kwargs = _layer_kwargs_for_current_layer(
+                model, layer, layer_input, layer_kwargs
+            )
+            fp_outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
+
+        layers[i] = layer.cpu()
+        del layer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        fp_inps, fp_outs = fp_outs, fp_inps
+
+    norm = getattr(model.model, "norm", None)
+    output_head = model.get_output_embeddings()
+    if output_head is None:
+        raise RuntimeError("Entropy-weighted GPTQ requires a causal LM output embedding layer.")
+    if norm is not None:
+        norm = norm.to(device)
+    output_head = output_head.to(device)
+
+    nsamples, seqlen, _ = fp_inps.shape
+    entropy = torch.full((nsamples, seqlen), float("nan"), dtype=torch.float32, device="cpu")
+    for j in tqdm.tqdm(range(nsamples), desc="(GPTQ Entropy FP) Logits"):
+        for start in range(0, max(seqlen - 1, 0), logits_chunk_size):
+            end = min(start + logits_chunk_size, seqlen - 1)
+            hidden = fp_inps[j, start:end].to(device)
+            if norm is not None:
+                hidden = norm(hidden)
+            logits = output_head(hidden).float()
+            probs = torch.softmax(logits, dim=-1)
+            chunk_entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
+            entropy[j, start:end].copy_(chunk_entropy.cpu())
+            del hidden, logits, probs, chunk_entropy
+
+    output_head = output_head.cpu()
+    if norm is not None:
+        norm = norm.cpu()
+    del fp_inps, fp_outs
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return entropy
+
+
+def _normalize_entropy_importance(entropy, valid_token_mask, alpha, norm_mode):
+    if entropy.shape != valid_token_mask.shape:
+        raise ValueError(
+            f"Entropy shape {tuple(entropy.shape)} must match token mask shape "
+            f"{tuple(valid_token_mask.shape)}."
+        )
+    if entropy.shape[1] < 2:
+        raise ValueError("Entropy-weighted GPTQ requires calibration sequences with at least 2 tokens.")
+
+    entropy_valid_mask = valid_token_mask.clone()
+    entropy_valid_mask[:, -1] = False
+    entropy_valid_mask[:, :-1] &= valid_token_mask[:, 1:]
+    entropy_valid_mask &= torch.isfinite(entropy)
+    if not entropy_valid_mask.any():
+        raise ValueError("No valid next-token entropy positions were found in calibration data.")
+
+    values = entropy[entropy_valid_mask]
+    eps = 1e-12
+    if norm_mode == "minmax":
+        value_range = values.max() - values.min()
+        normalized = (values - values.min()) / (value_range + eps) if value_range > 0 else torch.zeros_like(values)
+    elif norm_mode == "zscore":
+        std = values.std(unbiased=False)
+        if std > 0:
+            normalized = (values - values.mean()) / std
+            normalized = normalized - normalized.min()
+        else:
+            normalized = torch.zeros_like(values)
+    elif norm_mode == "mean":
+        mean = values.mean()
+        normalized = values / (mean + eps) if mean > 0 else torch.zeros_like(values)
+    else:
+        raise ValueError(f"Unsupported entropy normalization mode: {norm_mode}")
+
+    normalized = normalized.max() - normalized
+    token_weights = torch.ones_like(entropy, dtype=torch.float32)
+    token_weights[entropy_valid_mask] = 1.0 + alpha * normalized
+    token_weights[~valid_token_mask] = 0.0
+    if not torch.isfinite(token_weights).all() or torch.any(token_weights < 0):
+        raise ValueError("Entropy importance produced non-finite or negative token weights.")
+
+    valid_weights = token_weights[valid_token_mask]
+    logging.info(
+        "Token entropy stats: mean=%.6f std=%.6f min=%.6f max=%.6f",
+        values.mean().item(),
+        values.std(unbiased=False).item(),
+        values.min().item(),
+        values.max().item(),
+    )
+    logging.info(
+        "Token lambda stats: mean=%.6f std=%.6f min=%.6f max=%.6f",
+        valid_weights.mean().item(),
+        valid_weights.std(unbiased=False).item(),
+        valid_weights.min().item(),
+        valid_weights.max().item(),
+    )
+    return token_weights
+
+
+_LOCAL_IMPORTANCE_GROUPS = ("qkv", "o", "up_gate", "down")
+
+
+def _local_importance_group_for_linear(name):
+    if name in {
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "linear_attn.in_proj_qkv",
+        "linear_attn.in_proj_z",
+        "linear_attn.in_proj_b",
+        "linear_attn.in_proj_a",
+    }:
+        return "qkv"
+    if name in {"self_attn.o_proj", "linear_attn.out_proj"}:
+        return "o"
+    if name in {"mlp.up_proj", "mlp.gate_proj"}:
+        return "up_gate"
+    if name == "mlp.down_proj":
+        return "down"
+    raise ValueError(f"No local token-importance group is defined for linear: {name}")
+
+
+def _local_importance_representatives(layer):
+    full = find_qlayers(layer, layers=[nn.Linear])
+    qkv_name = "linear_attn.in_proj_qkv" if getattr(layer, "layer_type", None) == "linear_attention" else "self_attn.q_proj"
+    o_name = "linear_attn.out_proj" if getattr(layer, "layer_type", None) == "linear_attention" else "self_attn.o_proj"
+    names = {
+        "qkv": qkv_name,
+        "o": o_name,
+        "up_gate": "mlp.up_proj",
+        "down": "mlp.down_proj",
+    }
+    missing = [name for name in names.values() if name not in full]
+    if missing:
+        raise ValueError(f"entropy_grad cannot find required linear modules: {missing}")
+    return {group: full[name] for group, name in names.items()}
+
+
+def _activation_gradient_importance(activation, gradient):
+    if activation.shape != gradient.shape:
+        raise RuntimeError(
+            f"Activation shape {tuple(activation.shape)} does not match gradient shape {tuple(gradient.shape)}."
+        )
+    importance = torch.linalg.vector_norm(activation.float() * gradient.float(), dim=-1)
+    if importance.ndim == 1:
+        importance = importance.unsqueeze(0)
+    if importance.ndim != 2:
+        raise RuntimeError(
+            "Layer-local token importance must have shape [batch, seqlen], got "
+            f"{tuple(importance.shape)}."
+        )
+    if not torch.isfinite(importance).all() or torch.any(importance < 0):
+        raise RuntimeError("Layer-local token importance contains NaN, Inf, or negative values.")
+    return importance
+
+
+class _LayerLocalAttribution(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        layer,
+        model,
+        layer_kwargs,
+        device,
+        representatives,
+        importance_store,
+        layer_idx,
+        sample_start,
+    ):
+        ctx.layer = layer
+        ctx.model = model
+        ctx.layer_kwargs = layer_kwargs
+        ctx.device = device
+        ctx.representatives = representatives
+        ctx.importance_store = importance_store
+        ctx.layer_idx = layer_idx
+        ctx.sample_start = sample_start
+        ctx.save_for_backward(hidden_states.detach())
+
+        layer = layer.to(device)
+        try:
+            layer_input = hidden_states.to(device)
+            current_layer_kwargs = _layer_kwargs_for_current_layer(
+                model, layer, layer_input, layer_kwargs
+            )
+            output = _run_layer(layer, layer_input, current_layer_kwargs)
+            output_cpu = output.detach().cpu()
+        finally:
+            layer.cpu()
+        return output_cpu
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (hidden_states,) = ctx.saved_tensors
+        layer = ctx.layer.to(ctx.device)
+        captured = {}
+        handles = []
+
+        def capture_input(group):
+            def hook(_, inputs, __):
+                captured[group] = inputs[0]
+
+            return hook
+
+        for group, module in ctx.representatives.items():
+            handles.append(module.register_forward_hook(capture_input(group)))
+
+        try:
+            with torch.enable_grad():
+                layer_input = hidden_states.to(ctx.device).detach().requires_grad_(True)
+                current_layer_kwargs = _layer_kwargs_for_current_layer(
+                    ctx.model, layer, layer_input, ctx.layer_kwargs
+                )
+                output = _run_layer(layer, layer_input, current_layer_kwargs)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        missing = [group for group in _LOCAL_IMPORTANCE_GROUPS if group not in captured]
+        if missing:
+            raise RuntimeError(
+                f"Layer {ctx.layer_idx} did not capture local importance inputs for groups: {missing}"
+            )
+
+        targets = [layer_input] + [captured[group] for group in _LOCAL_IMPORTANCE_GROUPS]
+        gradients = torch.autograd.grad(
+            output,
+            targets,
+            grad_outputs=grad_output.to(ctx.device),
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=False,
+        )
+        grad_input = gradients[0].detach().cpu()
+
+        for group, activation, gradient in zip(
+            _LOCAL_IMPORTANCE_GROUPS,
+            targets[1:],
+            gradients[1:],
+        ):
+            importance = _activation_gradient_importance(activation.detach(), gradient.detach())
+            sample_end = ctx.sample_start + importance.shape[0]
+            if sample_end > len(ctx.importance_store[ctx.layer_idx][group]):
+                raise RuntimeError(
+                    f"Layer {ctx.layer_idx} group {group} attribution batch exceeds calibration samples."
+                )
+            for batch_idx in range(importance.shape[0]):
+                ctx.importance_store[ctx.layer_idx][group][ctx.sample_start + batch_idx] = (
+                    importance[batch_idx : batch_idx + 1].cpu()
+                )
+
+        del layer_input, output, targets, gradients, captured
+        layer.cpu()
+        return grad_input, None, None, None, None, None, None, None, None
+
+
+def _build_low_entropy_seed(normalized_hidden, output_head, valid_token_mask, logits_chunk_size=128):
+    batch_size, seqlen, _ = normalized_hidden.shape
+    entropy = torch.full(
+        (batch_size, seqlen),
+        float("nan"),
+        dtype=torch.float32,
+        device=normalized_hidden.device,
+    )
+    with torch.no_grad():
+        for start in range(0, seqlen - 1, logits_chunk_size):
+            end = min(start + logits_chunk_size, seqlen - 1)
+            logits = output_head(normalized_hidden[:, start:end].detach()).float()
+            probs = torch.softmax(logits, dim=-1)
+            entropy[:, start:end] = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
+            del logits, probs
+
+    seed_mask = valid_token_mask.clone()
+    seed_mask[:, -1] = False
+    seed_mask[:, :-1] &= valid_token_mask[:, 1:]
+    seed_mask &= torch.isfinite(entropy)
+    if not seed_mask.any():
+        raise RuntimeError("entropy_grad found no valid next-token positions in the current batch.")
+
+    seed = torch.zeros_like(entropy)
+    for batch_idx in range(batch_size):
+        sample_mask = seed_mask[batch_idx]
+        if not sample_mask.any():
+            raise RuntimeError(
+                f"entropy_grad found no valid next-token positions in batch item {batch_idx}."
+            )
+        values = entropy[batch_idx][sample_mask]
+        value_range = values.max() - values.min()
+        normalized = (
+            (values - values.min()) / (value_range + 1e-12)
+            if value_range > 0
+            else torch.zeros_like(values)
+        )
+        seed[batch_idx][sample_mask] = 1.0 - normalized
+    seed = seed.detach()
+    if not torch.isfinite(seed).all() or torch.any(seed < 0):
+        raise RuntimeError("Low-entropy seed contains NaN, Inf, or negative values.")
+    return seed
+
+
+def _margin_anchor_loss(normalized_hidden, output_head, seed, logits_chunk_size=128):
+    loss_sum = torch.zeros(
+        (normalized_hidden.shape[0],),
+        dtype=torch.float32,
+        device=normalized_hidden.device,
+    )
+    seqlen = normalized_hidden.shape[1]
+    for start in range(0, seqlen - 1, logits_chunk_size):
+        end = min(start + logits_chunk_size, seqlen - 1)
+        logits = output_head(normalized_hidden[:, start:end]).float()
+        top2 = torch.topk(logits, k=2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]
+        loss_sum = loss_sum - (seed[:, start:end] * margin).sum(dim=1)
+        del logits, top2, margin
+    valid_seed_sum = seed.sum(dim=1)
+    if torch.any(valid_seed_sum <= 0):
+        raise RuntimeError("Each calibration sample must have a low-entropy seed sum greater than 0.")
+    # Sum the independent per-sample objectives so each sample keeps the same
+    # gradient scale regardless of attribution batch size.
+    return (loss_sum / valid_seed_sum).sum()
+
+
+def _normalize_layer_local_importance(raw_importance, valid_token_mask, alpha, mean_normalize):
+    layer_weights = []
+    for layer_idx, layer_values in enumerate(raw_importance):
+        group_weights = {}
+        for group in _LOCAL_IMPORTANCE_GROUPS:
+            if any(value is None for value in layer_values[group]):
+                raise RuntimeError(f"Layer {layer_idx} group {group} has missing token importance.")
+            importance = torch.cat(layer_values[group], dim=0).float()
+            if importance.shape != valid_token_mask.shape:
+                raise RuntimeError(
+                    f"Layer {layer_idx} group {group} importance shape {tuple(importance.shape)} "
+                    f"does not match token mask shape {tuple(valid_token_mask.shape)}."
+                )
+            values = importance[valid_token_mask]
+            value_range = values.max() - values.min()
+            normalized = (values - values.min()) / (value_range + 1e-12) if value_range > 0 else torch.zeros_like(values)
+            weight = torch.zeros_like(importance)
+            weight[valid_token_mask] = 1.0 + alpha * normalized
+            if mean_normalize:
+                valid_mean = weight[valid_token_mask].mean()
+                if not torch.isfinite(valid_mean) or valid_mean <= 0:
+                    raise RuntimeError(f"Layer {layer_idx} group {group} has invalid weight mean.")
+                weight[valid_token_mask] /= valid_mean
+            if not torch.isfinite(weight).all() or torch.any(weight < 0):
+                raise RuntimeError(f"Layer {layer_idx} group {group} has invalid token weights.")
+
+            valid_weight = weight[valid_token_mask]
+            logging.info(
+                "Layer %d %s importance shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                layer_idx,
+                group,
+                tuple(importance.shape),
+                values.mean().item(),
+                values.std(unbiased=False).item(),
+                values.min().item(),
+                values.max().item(),
+            )
+            logging.info(
+                "Layer %d %s weight shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                layer_idx,
+                group,
+                tuple(weight.shape),
+                valid_weight.mean().item(),
+                valid_weight.std(unbiased=False).item(),
+                valid_weight.min().item(),
+                valid_weight.max().item(),
+            )
+            group_weights[group] = weight
+        layer_weights.append(group_weights)
+    return layer_weights
+
+
+def _compute_layer_local_token_weights(
+    model,
+    layers,
+    inps,
+    layer_kwargs,
+    valid_token_mask,
+    device,
+    alpha,
+    mean_normalize,
+    batch_size=1,
+):
+    logging.info("Computing layer-local entropy-gradient token importance.")
+    nsamples = inps.shape[0]
+    if batch_size <= 0:
+        raise ValueError("entropy_grad importance batch size must be greater than 0.")
+    batch_size = min(batch_size, nsamples)
+    logging.info(
+        "entropy_grad attribution batch size: %d (%d samples, %d batches).",
+        batch_size,
+        nsamples,
+        math.ceil(nsamples / batch_size),
+    )
+    raw_importance = [
+        {group: [None] * nsamples for group in _LOCAL_IMPORTANCE_GROUPS}
+        for _ in range(len(layers))
+    ]
+    requires_grad_state = [parameter.requires_grad for parameter in model.parameters()]
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.zero_grad(set_to_none=True)
+
+    norm = getattr(model.model, "norm", None)
+    output_head = model.get_output_embeddings()
+    if output_head is None:
+        raise RuntimeError("entropy_grad requires a causal LM output embedding layer.")
+    if norm is not None:
+        norm = norm.to(device)
+    output_head = output_head.to(device)
+
+    try:
+        sample_starts = range(0, nsamples, batch_size)
+        for sample_start in tqdm.tqdm(
+            sample_starts,
+            total=math.ceil(nsamples / batch_size),
+            desc="(GPTQ entropy_grad) Batches",
+        ):
+            sample_end = min(sample_start + batch_size, nsamples)
+            with torch.enable_grad():
+                hidden = inps[sample_start:sample_end].detach().requires_grad_(True)
+                for layer_idx, layer in enumerate(layers):
+                    representatives = _local_importance_representatives(layer)
+                    hidden = _LayerLocalAttribution.apply(
+                        hidden,
+                        layer,
+                        model,
+                        layer_kwargs,
+                        device,
+                        representatives,
+                        raw_importance,
+                        layer_idx,
+                        sample_start,
+                    )
+
+                hidden_device = hidden.to(device)
+                normalized_hidden = norm(hidden_device) if norm is not None else hidden_device
+                sample_mask = valid_token_mask[sample_start:sample_end].to(device)
+                current_batch_size = sample_end - sample_start
+                logits_chunk_size = max(1, 128 // current_batch_size)
+                seed = _build_low_entropy_seed(
+                    normalized_hidden,
+                    output_head,
+                    sample_mask,
+                    logits_chunk_size=logits_chunk_size,
+                )
+                loss_anchor = _margin_anchor_loss(
+                    normalized_hidden,
+                    output_head,
+                    seed,
+                    logits_chunk_size=logits_chunk_size,
+                )
+                loss_anchor.backward()
+
+            del hidden, hidden_device, normalized_hidden, sample_mask, seed, loss_anchor
+            model.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    finally:
+        output_head.cpu()
+        if norm is not None:
+            norm.cpu()
+        for layer in layers:
+            layer.cpu()
+        model.zero_grad(set_to_none=True)
+        for parameter, requires_grad in zip(model.parameters(), requires_grad_state):
+            parameter.requires_grad_(requires_grad)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return _normalize_layer_local_importance(
+        raw_importance,
+        valid_token_mask,
+        alpha=alpha,
+        mean_normalize=mean_normalize,
+    )
+
+
 def find_qlayers(module, layers=None, name=""):
     if layers is None:
         layers = [nn.Linear]
@@ -269,7 +847,7 @@ class GPTQ:
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
 
-    def add_batch(self, inp, out):
+    def add_batch(self, inp, out, token_weights=None):
         del out
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
@@ -280,11 +858,28 @@ class GPTQ:
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
+        if token_weights is not None:
+            token_weights = token_weights.reshape(-1)
+            if token_weights.numel() != inp.shape[1]:
+                raise ValueError(
+                    f"Token importance shape {tuple(token_weights.shape)} does not match "
+                    f"captured activation token count {inp.shape[1]}."
+                )
+            token_weights = token_weights.to(device=inp.device, dtype=inp.dtype)
+            if not torch.isfinite(token_weights).all() or torch.any(token_weights < 0):
+                raise ValueError("GPTQ token importance weights must be finite and non-negative.")
+            inp = inp * torch.sqrt(token_weights).unsqueeze(0)
         self.H += inp.matmul(inp.t())
+        if self.H.shape != (self.columns, self.columns):
+            raise RuntimeError(
+                f"GPTQ Hessian shape changed unexpectedly: {tuple(self.H.shape)}."
+            )
 
     def fasterquant(self, blocksize=128, groupsize=-1, percdamp=0.01):
         W = self.layer.weight.data.clone().float()
-        if not self.quantizer.ready():
+        if groupsize == -1:
+            self.quantizer.find_params(W)
+        elif not self.quantizer.ready():
             self.quantizer.find_params(W)
 
         H = self.H
@@ -354,77 +949,69 @@ def gptq_fwrd(model, dataloader, dev, args):
     model.config.use_cache = False
 
     layers = _get_layers(model)
-
-    if hasattr(model.model, "embed_tokens"):
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
-    if hasattr(model.model, "norm"):
-        model.model.norm = model.model.norm.to(device)
-    if hasattr(model.model, "rotary_emb"):
-        model.model.rotary_emb = model.model.rotary_emb.to(device)
-    layers[0] = layers[0].to(device)
-
     dtype = next(iter(model.parameters())).dtype
-    max_samples = args.gptq_cal_nsamples
-    inps = torch.zeros((max_samples, args.gptq_cal_seqlen, model.config.hidden_size), dtype=dtype, device=device)
-    cache = {"i": 0}
+    max_samples = args.cal_nsamples
+    token_importance = getattr(args, "token_importance", "none")
+    inps, layer_kwargs, valid_token_mask = _capture_calibration_inputs(
+        model,
+        layers,
+        dataloader,
+        device,
+        max_samples,
+        args.cal_seqlen,
+        dtype,
+    )
+    nsamples = inps.shape[0]
+    token_weights = None
+    layer_local_weights = None
 
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
+    if token_importance == "entropy":
+        entropy = _compute_fp_token_entropy(model, layers, inps, layer_kwargs, device)
+        token_weights = _normalize_entropy_importance(
+            entropy,
+            valid_token_mask,
+            alpha=args.entropy_alpha,
+            norm_mode=args.entropy_norm,
+        )
+        del entropy, inps
 
-        def forward(self, inp, **kwargs):
-            idx = cache["i"]
-            if idx < max_samples:
-                inps[idx] = inp
-            cache["i"] += 1
-            for key, val in kwargs.items():
-                cache[key] = val
-            raise ValueError
+        inps, layer_kwargs, recaptured_mask = _capture_calibration_inputs(
+            model,
+            layers,
+            dataloader,
+            device,
+            max_samples,
+            args.cal_seqlen,
+            dtype,
+        )
+        if inps.shape[0] != nsamples or not torch.equal(valid_token_mask, recaptured_mask):
+            raise RuntimeError("Calibration data changed between entropy prepass and GPTQ capture.")
+        del recaptured_mask
+    elif token_importance == "entropy_grad":
+        layer_local_weights = _compute_layer_local_token_weights(
+            model,
+            layers,
+            inps,
+            layer_kwargs,
+            valid_token_mask,
+            device,
+            alpha=args.importance_alpha,
+            mean_normalize=args.importance_mean_normalize,
+            batch_size=args.importance_batch_size,
+        )
+    elif token_importance != "none":
+        raise ValueError(f"Unsupported GPTQ token importance mode: {token_importance}")
 
-    layers[0] = Catcher(layers[0])
-    for batch in dataloader:
-        if cache["i"] >= max_samples:
-            break
-
-        if _is_qwen3_5_text_model(model):
-            _validate_no_padding_attention_mask(batch)
-
-        if isinstance(batch, (list, tuple)):
-            input_ids = batch[0]
-        elif isinstance(batch, dict):
-            input_ids = batch["input_ids"]
-        else:
-            input_ids = batch
-
-        try:
-            model(input_ids.to(device))
-        except ValueError:
-            pass
-
-    layers[0] = layers[0].module
-
-    nsamples = min(cache["i"], max_samples)
-    if nsamples == 0:
-        raise RuntimeError("Calibration dataloader produced zero samples.")
-
-    inps = inps[:nsamples]
     outs = torch.zeros_like(inps)
-
-    layers[0] = layers[0].cpu()
-    if hasattr(model.model, "embed_tokens"):
-        model.model.embed_tokens = model.model.embed_tokens.cpu()
-    if hasattr(model.model, "norm"):
-        model.model.norm = model.model.norm.cpu()
-    if hasattr(model.model, "rotary_emb"):
-        model.model.rotary_emb = model.model.rotary_emb.cpu()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    layer_kwargs = {k: v for k, v in cache.items() if k != "i"}
+    active_token_weights = None
 
     for i in tqdm.tqdm(range(len(layers)), desc="(GPTQ Quant.) Layers"):
         layer = layers[i].to(device)
+        logging.info(
+            "GPTQ layer %d token-importance Hessian mode: %s",
+            i,
+            token_importance,
+        )
         full = find_qlayers(layer, layers=[nn.Linear])
         quant_groups = _get_quant_groups(model, layer)
 
@@ -432,6 +1019,18 @@ def gptq_fwrd(model, dataloader, dev, args):
             subset = {name: full[name] for name in names if name in full}
             if not subset:
                 continue
+
+            group_token_weights = token_weights
+            if layer_local_weights is not None:
+                importance_groups = {
+                    _local_importance_group_for_linear(name) for name in subset
+                }
+                if len(importance_groups) != 1:
+                    raise RuntimeError(
+                        f"GPTQ quantization group mixes token-importance groups: {sorted(subset)}"
+                    )
+                importance_group = importance_groups.pop()
+                group_token_weights = layer_local_weights[i][importance_group]
 
             gptq_blocks = {}
             for name, sub_layer in subset.items():
@@ -445,16 +1044,25 @@ def gptq_fwrd(model, dataloader, dev, args):
 
             def add_batch(name):
                 def tmp(_, inp, out):
-                    gptq_blocks[name].add_batch(inp[0].data, out.data)
+                    gptq_blocks[name].add_batch(
+                        inp[0].data,
+                        out.data,
+                        token_weights=active_token_weights,
+                    )
 
                 return tmp
 
             handles = [subset[name].register_forward_hook(add_batch(name)) for name in gptq_blocks]
 
             for j in range(nsamples):
-                layer_input = inps[j].unsqueeze(0)
+                active_token_weights = (
+                    group_token_weights[j].to(device)
+                    if group_token_weights is not None
+                    else None
+                )
+                layer_input = inps[j].unsqueeze(0).to(device)
                 current_layer_kwargs = _layer_kwargs_for_current_layer(model, layer, layer_input, layer_kwargs)
-                outs[j] = _run_layer(layer, layer_input, current_layer_kwargs)
+                outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
 
             for handle in handles:
                 handle.remove()
@@ -467,9 +1075,9 @@ def gptq_fwrd(model, dataloader, dev, args):
                 block.free()
 
         for j in range(nsamples):
-            layer_input = inps[j].unsqueeze(0)
+            layer_input = inps[j].unsqueeze(0).to(device)
             current_layer_kwargs = _layer_kwargs_for_current_layer(model, layer, layer_input, layer_kwargs)
-            outs[j] = _run_layer(layer, layer_input, current_layer_kwargs)
+            outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
 
         layers[i] = layer.cpu()
         del layer
