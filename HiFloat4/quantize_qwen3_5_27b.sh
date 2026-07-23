@@ -20,7 +20,7 @@ DTYPE="${DTYPE:-float16}"
 CAL_DATASET="${CAL_DATASET:-c4}"
 CAL_NSAMPLES="${CAL_NSAMPLES:-512}"
 CAL_SEQLEN="${CAL_SEQLEN:-512}"
-CAL_SLICE_MODE="${CAL_SLICE_MODE:-random}"
+CAL_SLICE_MODE="${CAL_SLICE_MODE:-head}"
 CAL_SLICE_OFFSET="${CAL_SLICE_OFFSET:-0}"
 GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
 BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}" #magr中 -1是per_layer
@@ -31,7 +31,11 @@ IMPORTANCE_ALPHA="${IMPORTANCE_ALPHA:-1.0}"
 IMPORTANCE_MEAN_NORMALIZE="${IMPORTANCE_MEAN_NORMALIZE:-true}"
 IMPORTANCE_BATCH_SIZE="${IMPORTANCE_BATCH_SIZE:-1}"
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
+HIF4A="${HIF4A:-false}"
+ACT_QUANT_FORMAT="${ACT_QUANT_FORMAT:-hif4}"
 SMOOTHQUANT_ALPHA="${SMOOTHQUANT_ALPHA:-0.5}"
+SMOOTHQUANT_SCALE_ONLY="${SMOOTHQUANT_SCALE_ONLY:-false}"
+SAVE_NVFP4_ACTIVATION_SCALES="${SAVE_NVFP4_ACTIVATION_SCALES:-true}"
 AWQ_N_GRID="${AWQ_N_GRID:-20}"
 MAGR_CD_ITER="${MAGR_CD_ITER:-3}"
 MAGR_ALPHA="${MAGR_ALPHA:-0.001}"
@@ -62,6 +66,8 @@ python HiFloat4/main.py \
   --dtype "${DTYPE}" \
   --hif4w true \
   --hif4_weight_format "${HIF4_WEIGHT_FORMAT}" \
+  --hif4a "${HIF4A}" \
+  --act_quant_format "${ACT_QUANT_FORMAT}" \
   --gptq "${GPTQ}" \
   --smoothquant "${SMOOTHQUANT}" \
   --awq "${AWQ}" \
@@ -81,6 +87,8 @@ python HiFloat4/main.py \
   --importance_mean_normalize "${IMPORTANCE_MEAN_NORMALIZE}" \
   --importance_batch_size "${IMPORTANCE_BATCH_SIZE}" \
   --smoothquant_alpha "${SMOOTHQUANT_ALPHA}" \
+  --smoothquant_scale_only "${SMOOTHQUANT_SCALE_ONLY}" \
+  --save_nvfp4_activation_scales "${SAVE_NVFP4_ACTIVATION_SCALES}" \
   --awq_n_grid "${AWQ_N_GRID}" \
   --magr_cd_iter "${MAGR_CD_ITER}" \
   --magr_alpha "${MAGR_ALPHA}" \

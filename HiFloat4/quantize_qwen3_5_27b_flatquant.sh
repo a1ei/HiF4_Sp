@@ -14,6 +14,8 @@ MODEL="${MODEL:-Qwen/Qwen3.5-27B}"
 OUTPUT="${OUTPUT:-Qmodel/Qwen3.5-27b-Hif4-FlatQuant}"
 DTYPE="${DTYPE:-float16}"
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
+HIF4A="${HIF4A:-false}"
+ACT_QUANT_FORMAT="${ACT_QUANT_FORMAT:-hif4}"
 CAL_DATASET="${CAL_DATASET:-c4}"
 CAL_NSAMPLES="${CAL_NSAMPLES:-128}"
 CAL_SEQLEN="${CAL_SEQLEN:-4096}"
@@ -37,6 +39,8 @@ python HiFloat4/main.py \
   --model "${MODEL}" \
   --dtype "${DTYPE}" \
   --hif4_weight_format "${HIF4_WEIGHT_FORMAT}" \
+  --hif4a "${HIF4A}" \
+  --act_quant_format "${ACT_QUANT_FORMAT}" \
   --flatquant true \
   --gptq_save_path "${OUTPUT}" \
   --cal_dataset "${CAL_DATASET}" \

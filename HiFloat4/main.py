@@ -110,9 +110,21 @@ def _no_split_module_classes(model):
 
 def _save_quantized_model(model, path: str, tokenizer=None, args=None) -> None:
     os.makedirs(path, exist_ok=True)
-    model.save_pretrained(path, safe_serialization=False, max_shard_size="5GB")
+    safe_serialization = bool(
+        getattr(args, "safe_serialization", False) if args is not None else False
+    )
+    model.save_pretrained(
+        path,
+        safe_serialization=safe_serialization,
+        max_shard_size="5GB",
+    )
     if tokenizer is not None:
         tokenizer.save_pretrained(path)
+    nvfp4_activation_scales = getattr(model, "_nvfp4_activation_scales", None)
+    if nvfp4_activation_scales:
+        from hif4smoothquant.smoothquant_utils import save_nvfp4_activation_scales
+
+        save_nvfp4_activation_scales(nvfp4_activation_scales, path)
     if args is not None:
         with open(os.path.join(path, "quantization_args.json"), "w", encoding="utf-8") as f:
             json.dump(vars(args), f, indent=2, sort_keys=True, ensure_ascii=False, default=str)
@@ -172,14 +184,19 @@ def _is_excluded_layer(name: str, exclude_layers: list[str]) -> bool:
     return name in exclude_layers
 
 
-def _hif4_weight_qtype(weight_format: str) -> str:
+def _quant_format_qtype(quant_format: str) -> str:
     mapping = {
         "hif4": "hifx4",
         "hif4-1": "hifx4_1",
+        "nvfp4": "nvf4",
     }
-    if weight_format not in mapping:
-        raise ValueError(f"Unsupported hif4 weight format: {weight_format}")
-    return mapping[weight_format]
+    if quant_format not in mapping:
+        raise ValueError(f"Unsupported quant format: {quant_format}")
+    return mapping[quant_format]
+
+
+def _hif4_weight_qtype(weight_format: str) -> str:
+    return _quant_format_qtype(weight_format)
 
 
 @torch.no_grad()
@@ -216,15 +233,16 @@ def hif4_rtn_quant(model: nn.Module, args: argparse.Namespace) -> nn.Module:
 
 
 def replace_linear_with_hif4_activation_quant(module: nn.Module, args: argparse.Namespace) -> nn.Module:
-    hif4_qtype = QType("hifx4")
+    act_qtype_name = getattr(args, "act_quant_qtype", _quant_format_qtype(args.act_quant_format))
+    act_qtype = QType(act_qtype_name)
 
     if isinstance(module, nn.Linear):
         if _is_excluded_layer("", args.exclude_layers):
             return module
         new_module = QLinear2(module.in_features, module.out_features, module.bias is not None)
         new_module.transfer(module)
-        new_module.assign_qparams(hif4_qtype)
-        new_module.assign_input_qparams(hif4_qtype)
+        new_module.assign_qparams(act_qtype)
+        new_module.assign_input_qparams(act_qtype)
         new_module.set_quant_grad(False)
         new_module._fast_forward = not args.disable_fast_forward
         return new_module
@@ -240,8 +258,8 @@ def replace_linear_with_hif4_activation_quant(module: nn.Module, args: argparse.
         if isinstance(child, nn.Linear):
             new_module = QLinear2(child.in_features, child.out_features, child.bias is not None)
             new_module.transfer(child)
-            new_module.assign_qparams(hif4_qtype)
-            new_module.assign_input_qparams(hif4_qtype)
+            new_module.assign_qparams(act_qtype)
+            new_module.assign_input_qparams(act_qtype)
             new_module.set_quant_grad(False)
             new_module._fast_forward = not args.disable_fast_forward
             parent_name = ".".join(name.split(".")[:-1])
@@ -249,7 +267,11 @@ def replace_linear_with_hif4_activation_quant(module: nn.Module, args: argparse.
             setattr(parent_module, name.split(".")[-1], new_module)
             replaced_layers += 1
 
-    logging.info("Replaced %s Linear layers with HiF4 activation-only QLinear2.", replaced_layers)
+    logging.info(
+        "Replaced %s Linear layers with %s activation-only QLinear2.",
+        replaced_layers,
+        args.act_quant_format,
+    )
     return module
 
 
@@ -300,16 +322,34 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
         default=["arc_challenge", "arc_easy", "boolq", "openbookqa", "piqa", "winogrande", "hellaswag",]
     )
     parser.add_argument("--test_zero_task", action="store_true")
+    parser.add_argument(
+        "--save_only",
+        action="store_true",
+        help="Save the transformed model and stop before PPL/zero-shot evaluation.",
+    )
+    parser.add_argument(
+        "--safe_serialization",
+        type=str2bool,
+        default=False,
+        help="Save model shards as safetensors instead of PyTorch bin files.",
+    )
 
     parser.add_argument("--hif4w", type=str2bool, default=False, help="Enable one-shot HiF4 weight fake quantization")
     parser.add_argument(
         "--hif4_weight_format",
         type=str,
         default="hif4",
-        choices=["hif4", "hif4-1"],
+        choices=["hif4", "hif4-1", "nvfp4"],
         help="HiF4 weight fake quant format for RTN/GPTQ.",
     )
     parser.add_argument("--hif4a", type=str2bool, default=False, help="Enable HiF4 input activation fake quantization")
+    parser.add_argument(
+        "--act_quant_format",
+        type=str,
+        default="hif4",
+        choices=["hif4", "hif4-1", "nvfp4"],
+        help="Input activation fake quant format used when --hif4a is true.",
+    )
     parser.add_argument("--exclude-layers", nargs="*", default=["lm_head"], help="Exact layer names to skip")
     parser.add_argument("--disable-fast-forward", action="store_true", help="Disable QLinear2 fast-forward path")
 
@@ -319,7 +359,7 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--cal_dataset",
         type=str,
         default="c4",
-        choices=["wikitext2", "ptb", "c4", "s1k-1.1"],
+        choices=["wikitext2", "ptb", "c4", "s1k-1.1", "taco"],
     )
     parser.add_argument("--cal_nsamples", type=int, default=512)
     parser.add_argument("--cal_seqlen", type=int, default=512)
@@ -363,6 +403,18 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
     )
     parser.add_argument("--smoothquant", type=str2bool, default=False)
     parser.add_argument("--smoothquant_alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--smoothquant_scale_only",
+        type=str2bool,
+        default=False,
+        help="Only calibrate/apply SmoothQuant scales; skip SmoothQuant weight quantization.",
+    )
+    parser.add_argument(
+        "--save_nvfp4_activation_scales",
+        type=str2bool,
+        default=True,
+        help="Save nvfp4_activation_scales.safetensors for vLLM NVFP4 fake activation when using NVFP4-related quantization.",
+    )
     parser.add_argument("--awq", type=str2bool, default=False)
     parser.add_argument("--awq_n_grid", type=int, default=20)
     parser.add_argument("--magr", type=str2bool, default=False)
@@ -394,6 +446,11 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
     logger.info("Running with args: %s", vars(args))
     set_seed(args.seed)
     args.hif4_weight_qtype = _hif4_weight_qtype(args.hif4_weight_format)
+    args.act_quant_qtype = _quant_format_qtype(args.act_quant_format)
+    if args.save_only and not args.gptq_save_path:
+        raise ValueError("--save_only requires --gptq_save_path.")
+    if args.smoothquant_scale_only and not args.smoothquant:
+        raise ValueError("--smoothquant_scale_only requires --smoothquant true.")
     if args.hif4_weight_qtype == "hifx4_1" and (args.gptq or args.magr) and args.block_size_linear != 64:
         raise ValueError("hif4-1 GPTQ/MagR requires --block_size_linear 64.")
     enabled_weight_methods = sum(bool(x) for x in (args.gptq, args.smoothquant, args.awq, args.magr, args.flatquant))
@@ -421,10 +478,10 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
             raise ValueError("--cal_slice_offset must be greater than or equal to 0.")
         if args.cal_slice_mode != "offset" and args.cal_slice_offset != 0:
             raise ValueError("--cal_slice_offset can only be non-zero when --cal_slice_mode=offset.")
-        if args.cal_dataset != "s1k-1.1" and (
+        if args.cal_dataset not in {"s1k-1.1", "taco"} and (
             args.cal_slice_mode != "random" or args.cal_slice_offset != 0
         ):
-            raise ValueError("Calibration slice controls currently only support --cal_dataset=s1k-1.1.")
+            raise ValueError("Calibration slice controls currently only support --cal_dataset=s1k-1.1 or taco.")
         if args.flatquant and args.cal_nsamples % args.flatquant_cali_bsz != 0:
             raise ValueError("--cal_nsamples must be divisible by --flatquant_cali_bsz.")
 
@@ -473,13 +530,19 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
         if args.gptq_save_path:
             _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
     elif args.smoothquant:
-        if args.hif4w:
+        if args.hif4w and args.smoothquant_scale_only:
+            logger.info("Applying %s RTN before SmoothQuant scale-only.", args.hif4_weight_format)
+            model = hif4_rtn_quant(model, args)
+        elif args.hif4w:
             logger.info("Both --hif4w and --smoothquant are enabled; SmoothQuant controls weight quantization and HiF4 RTN is skipped.")
 
         from hif4smoothquant import smoothquant_utils
         import brq.calib as calib
 
-        logger.info("Quantizing model weights with HiFloat4 SmoothQuant.")
+        if args.smoothquant_scale_only:
+            logger.info("Calibrating and applying SmoothQuant scales without final weight quantization.")
+        else:
+            logger.info("Quantizing model weights with HiFloat4 SmoothQuant.")
         trainloader = calib.get_loaders(
             args.cal_dataset,
             nsamples=args.cal_nsamples,
@@ -561,8 +624,15 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
             _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
 
     if args.hif4a:
-        logger.info("Replacing Linear layers with HiF4 activation-only QLinear2.")
+        logger.info(
+            "Replacing Linear layers with %s activation-only QLinear2.",
+            args.act_quant_format,
+        )
         model = replace_linear_with_hif4_activation_quant(model, args)
+
+    if args.save_only:
+        logger.info("Save-only mode complete; skipping PPL and zero-shot evaluation.")
+        return
 
     dataset = data_utils.get_dataset(args.ppl_tasks[0])
     test_loader = data_utils.prepare_test_dataloader(dataset=dataset["test"], tokenizer=tokenizer, batch_size=1)

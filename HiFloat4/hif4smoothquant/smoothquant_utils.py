@@ -1,4 +1,5 @@
 import logging
+import os
 import pathlib
 import sys
 
@@ -16,7 +17,6 @@ if str(HIF4GPTQ_ROOT) not in sys.path:
 from gptq.gptq_utils import (
     _get_layers,
     _is_qwen3_5_text_model,
-    _layer_kwargs_for_current_layer,
     _run_layer,
     _validate_no_padding_attention_mask,
     find_qlayers,
@@ -28,6 +28,9 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 SMOOTH_MIN_SCALE = 1e-5
+NVFP4_ACTIVATION_SCALES_FILE = "nvfp4_activation_scales.safetensors"
+NVFP4_FP4_E2M1_MAX = 6.0
+NVFP4_FP8_E4M3FN_MAX = 448.0
 
 
 def _is_excluded_layer(name: str, exclude_layers: list[str]) -> bool:
@@ -40,8 +43,152 @@ def _global_layer_name(layer_idx: int, local_name: str) -> str:
 
 def _input_channel_absmax(inp: torch.Tensor) -> torch.Tensor:
     if inp.shape[-1] == 0:
-        raise ValueError("SmoothQuant received an empty input channel dimension.")
+        raise ValueError("Activation calibration received an empty input channel dimension.")
     return inp.detach().abs().float().view(-1, inp.shape[-1]).max(dim=0)[0]
+
+
+def _make_causal_mask(hidden_states: torch.Tensor) -> torch.Tensor:
+    if not torch.is_floating_point(hidden_states):
+        raise TypeError("Causal mask requires floating-point hidden states.")
+
+    batch_size, seq_len, _ = hidden_states.shape
+    min_value = torch.finfo(hidden_states.dtype).min
+    mask = torch.full(
+        (seq_len, seq_len),
+        min_value,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    mask = torch.triu(mask, diagonal=1)
+    return mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+
+
+def _make_qwen3_5_causal_mask(model, hidden_states, layer_kwargs):
+    attention_mask = layer_kwargs.get("attention_mask")
+    if torch.is_tensor(attention_mask) and attention_mask.ndim >= 4:
+        return attention_mask
+
+    try:
+        from transformers.masking_utils import create_causal_mask
+
+        mask = create_causal_mask(
+            config=model.config,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            cache_position=layer_kwargs.get("cache_position"),
+            past_key_values=None,
+            position_ids=layer_kwargs.get("position_ids"),
+        )
+        if mask is None:
+            return _make_causal_mask(hidden_states)
+        return mask
+    except Exception as exc:
+        logging.warning(
+            "Falling back to local causal mask for Qwen3.5 activation calibration: %s",
+            exc,
+        )
+        return _make_causal_mask(hidden_states)
+
+
+def _layer_kwargs_for_current_layer(model, layer, hidden_states, base_layer_kwargs):
+    layer_kwargs = dict(base_layer_kwargs)
+    if not _is_qwen3_5_text_model(model):
+        return layer_kwargs
+
+    layer_kwargs["past_key_values"] = None
+    layer_kwargs["use_cache"] = False
+
+    layer_type = getattr(layer, "layer_type", None)
+    if layer_type == "linear_attention":
+        layer_kwargs["attention_mask"] = None
+    elif layer_type == "full_attention":
+        layer_kwargs["attention_mask"] = _make_qwen3_5_causal_mask(
+            model, hidden_states, layer_kwargs
+        )
+    else:
+        raise ValueError(f"Unsupported Qwen3.5 layer_type: {layer_type}")
+    return layer_kwargs
+
+
+def _nvfp4_input_global_scale(absmax: torch.Tensor) -> torch.Tensor:
+    max_abs = absmax.detach().float().amax()
+    if not torch.isfinite(max_abs):
+        raise ValueError("NVFP4 activation scale calibration produced a non-finite max.")
+    if max_abs <= 0:
+        return torch.tensor([1.0], dtype=torch.float32)
+    return torch.tensor(
+        [NVFP4_FP8_E4M3FN_MAX * NVFP4_FP4_E2M1_MAX / max_abs.item()],
+        dtype=torch.float32,
+    )
+
+
+def build_nvfp4_activation_scales(
+    act_absmax: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    return {
+        f"{name}.input_global_scale": _nvfp4_input_global_scale(absmax).contiguous()
+        for name, absmax in act_absmax.items()
+    }
+
+
+@torch.no_grad()
+def collect_nvfp4_activation_scales(
+    model,
+    dataloader,
+    dev,
+    args,
+) -> dict[str, torch.Tensor]:
+    use_cache = getattr(model.config, "use_cache", None)
+    if use_cache is not None:
+        model.config.use_cache = False
+    try:
+        act_absmax = _get_act_scales(
+            model,
+            dataloader,
+            torch.device(dev),
+            args,
+            desc="(NVFP4 Act Scale Calib.) Layers",
+        )
+    finally:
+        if use_cache is not None:
+            model.config.use_cache = use_cache
+    return build_nvfp4_activation_scales(act_absmax)
+
+
+def attach_nvfp4_activation_scales(
+    model,
+    dataloader,
+    dev,
+    args,
+) -> dict[str, torch.Tensor]:
+    scales = collect_nvfp4_activation_scales(model, dataloader, dev, args)
+    model._nvfp4_activation_scales = scales
+    logging.info("Collected %s NVFP4 activation scales for vLLM.", len(scales))
+    return scales
+
+
+def save_nvfp4_activation_scales(
+    scales: dict[str, torch.Tensor],
+    output_dir: str,
+) -> str:
+    from safetensors.torch import save_file
+
+    if not scales:
+        raise ValueError("No NVFP4 activation scales to save.")
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, NVFP4_ACTIVATION_SCALES_FILE)
+    save_file(scales, path, metadata={"format": "pt"})
+    logging.info("Saved NVFP4 activation scales to %s", path)
+    return path
+
+
+def should_save_nvfp4_activation_scales(args) -> bool:
+    if not getattr(args, "save_nvfp4_activation_scales", True):
+        return False
+    return (
+        getattr(args, "hif4_weight_format", "") == "nvfp4"
+        or getattr(args, "act_quant_format", "") == "nvfp4"
+    )
 
 
 def _record_linear_input_absmax(act_scales: dict[str, torch.Tensor], name: str, inp) -> None:
@@ -133,14 +280,20 @@ def _capture_first_layer_inputs(model, dataloader, device: torch.device, args):
 
 
 @torch.no_grad()
-def _get_act_scales(model, dataloader, device: torch.device, args) -> dict[str, torch.Tensor]:
+def _get_act_scales(
+    model,
+    dataloader,
+    device: torch.device,
+    args,
+    desc: str = "(SmoothQuant Calib.) Layers",
+) -> dict[str, torch.Tensor]:
     layers, inps, layer_kwargs, nsamples = _capture_first_layer_inputs(
         model, dataloader, device, args
     )
     outs = torch.zeros_like(inps)
     act_scales: dict[str, torch.Tensor] = {}
 
-    for i in tqdm.tqdm(range(len(layers)), desc="(SmoothQuant Calib.) Layers"):
+    for i in tqdm.tqdm(range(len(layers)), desc=desc):
         layer = layers[i].to(device)
         full = find_qlayers(layer, layers=[nn.Linear])
 
@@ -354,7 +507,11 @@ def _quantize_model_weights(
 
 @torch.no_grad()
 def smoothquant_fwrd(model, dataloader, dev, args):
-    logging.info("----- HiFloat4 SmoothQuant Weight Quantization -----")
+    scale_only = getattr(args, "smoothquant_scale_only", False)
+    if scale_only:
+        logging.info("----- HiFloat4 SmoothQuant Scale-Only Calibration -----")
+    else:
+        logging.info("----- HiFloat4 SmoothQuant Weight Quantization -----")
     device = torch.device(dev)
     if device.type != "cuda":
         raise RuntimeError("HiF4 SmoothQuant requires CUDA because quant_dequant_float uses a CUDA kernel.")
@@ -370,8 +527,17 @@ def smoothquant_fwrd(model, dataloader, dev, args):
     try:
         act_scales = _get_act_scales(model, dataloader, device, args)
         _smooth_lm(model, act_scales, alpha, device)
-        _quantize_model_weights(model, qparams, device, exclude_layers)
+        if scale_only:
+            logging.info("Skipping SmoothQuant final weight quantization.")
+        else:
+            _quantize_model_weights(model, qparams, device, exclude_layers)
+        if should_save_nvfp4_activation_scales(args):
+            logging.info("Collecting post-SmoothQuant NVFP4 activation scales.")
+            attach_nvfp4_activation_scales(model, dataloader, device, args)
     finally:
         model.config.use_cache = use_cache
 
-    logging.info("----- HiFloat4 SmoothQuant Weight Quantization Done -----")
+    if scale_only:
+        logging.info("----- HiFloat4 SmoothQuant Scale-Only Calibration Done -----")
+    else:
+        logging.info("----- HiFloat4 SmoothQuant Weight Quantization Done -----")

@@ -1,0 +1,6 @@
+config,model,aime_pass_run1,aime_pass_run2,aime_pass_run3,aime_pass_run4,aime_pass_run5,aime_pass_mean,aime_pass_sample_std,aime_avg_run1,aime_avg_run2,aime_avg_run3,aime_avg_run4,aime_avg_run5,aime_avg_mean,aime_avg_sample_std,lcb_codegen_pass_at_1_16,lcb_stderr,mmlu_pro_extractive_match,mmlu_pro_stderr
+fp32w_fp32a,Qwen3-8B-FPQuant-QAT-NVFP4-Dequant-FP32-NoHadamard,0.6333,0.5667,0.5333,0.6000,0.6667,0.600000,0.052715,0.6333,0.5667,0.5667,0.6333,0.6667,0.613340,0.044706,0.4629,0.0378,0.7153,0.0082
+fp32w_bf16a,Qwen3-8B-FPQuant-QAT-NVFP4-Dequant-FP32-NoHadamard,0.5333,0.5000,0.4667,0.6000,0.4333,0.506660,0.064119,0.5333,0.5333,0.5333,0.6333,0.5000,0.546640,0.050545,0.4229,0.0375,0.7180,0.0082
+bf16w_bf16a,Qwen3-8B-FPQuant-QAT-NVFP4-Dequant-BF16-NoHadamard,0.5000,0.5333,0.5333,0.6000,0.6667,0.566660,0.066688,0.4667,0.5333,0.5667,0.5667,0.6667,0.560020,0.072271,0.4114,0.0373,0.7210,0.0082
+bf16w_hif4a,Qwen3-8B-FPQuant-QAT-NVFP4-Dequant-BF16-NoHadamard,0.5667,0.6000,0.4000,0.5000,0.5000,0.513340,0.076745,0.5667,0.5667,0.4333,0.5667,0.5000,0.526680,0.059658,0.4171,0.0374,0.7037,0.0083
+sq_bf16w_hif4a,Qwen3-8B-FPQuant-QAT-NVFP4-Dequant-BF16-SQScaleOnly,0.5667,0.5333,0.5333,0.5333,0.4667,0.526660,0.036506,0.6000,0.5667,0.5667,0.5333,0.5000,0.553340,0.038016,0.4171,0.0374,0.6997,0.0084

@@ -146,7 +146,7 @@ conda activate hif4
 
 AWQ、SmoothQuant、MagR、GPTQ、FlatQuant 共用 `CAL_DATASET`、`CAL_NSAMPLES`、`CAL_SEQLEN`、`CAL_SLICE_MODE` 和 `CAL_SLICE_OFFSET` 校准参数。对应的 Python 参数统一以 `--cal_` 开头。
 
-校准数据集支持 `wikitext2`、`ptb`、`c4` 和 `s1k-1.1`。`s1k-1.1` 按 `question + deepseek_thinking_trajectory + deepseek_attempt` 的顺序用两个换行连接，再在完整序列内选择切片位置。数据集的 `solution` 只是很短的标准答案，不作为 s1.1 推理轨迹使用。这样 `head` 通常包含 problem，`tail` 通常只包含 DeepSeek 推理或回答后段，可直接比较 problem 是否改善校准效果：
+校准数据集支持 `wikitext2`、`ptb`、`c4`、`s1k-1.1` 和 `taco`。`s1k-1.1` 按 `question + deepseek_thinking_trajectory + deepseek_attempt` 的顺序用两个换行连接，再在完整序列内选择切片位置。`taco` 使用 `BAAI/TACO` 的 train split，按 LiveCodeBench v6 test 的题面去重后，取 `question + starter_code + first_solution`；每条校准样本都从一个 `Question:` 开始，不够 `CAL_SEQLEN` 时继续拼接后续题目补足。s1k-1.1 的 `solution` 只是很短的标准答案，不作为 s1.1 推理轨迹使用。这样 `head` 通常包含 problem，`tail` 通常只包含 DeepSeek 推理或回答后段，可直接比较 problem 是否改善校准效果：
 
 - `CAL_SLICE_MODE=random`：随机切片。
 - `CAL_SLICE_MODE=head`：取前 `CAL_SEQLEN` 个 token。
@@ -207,6 +207,21 @@ OUTPUT=Qmodel/Qwen3.5-27b-Hif4-SmoothQuant \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
+NVFP4 RTN + SmoothQuant scale-only + 激活量化：
+
+```bash
+AWQ=false \
+SMOOTHQUANT=true \
+SMOOTHQUANT_SCALE_ONLY=true \
+HIF4_WEIGHT_FORMAT=nvfp4 \
+HIF4A=true \
+ACT_QUANT_FORMAT=nvfp4 \
+OUTPUT=Qmodel/Qwen3.5-27b-NVFP4-RTN-SQScaleOnly-ACTNVFP4 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
+这条路径先把 FP16 权重用 `nvf4` 做 RTN fake quant-dequant，再用反量化后的权重校准并应用 SmoothQuant scale。Scale 已经通过前置 norm 和 Linear 权重写进模型，所以权重缩放不需要额外 scale 文件。`ACT_QUANT_FORMAT` 可选 `nvfp4`、`hif4`、`hif4-1`；激活 fake quant 只在本次 `HiFloat4/main.py` 运行里生效，不会保存进普通 Hugging Face checkpoint。
+
 ### MagR
 
 MagR 需要关掉默认 AWQ：
@@ -251,9 +266,9 @@ bash HiFloat4/quantize_qwen3_5_27b_flatquant.sh
 
 注意：`CAL_NSAMPLES` 必须能被 `FLATQUANT_CALI_BSZ` 整除。脚本默认 `CAL_NSAMPLES=128`、`FLATQUANT_CALI_BSZ=4`。
 
-### hif4-1
+### hif4-1 / nvfp4
 
-AWQ、SmoothQuant、MagR、FlatQuant 都支持切换到 `hif4-1`：
+AWQ、SmoothQuant、MagR、FlatQuant 都支持切换到 `hif4-1`。普通 RTN 和 SmoothQuant scale-only 还支持 `nvfp4`：
 
 ```bash
 HIF4_WEIGHT_FORMAT=hif4-1 \

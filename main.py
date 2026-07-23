@@ -270,6 +270,12 @@ def parse_args():
         help="top_k 采样。默认: 20",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="vLLM 采样随机种子。默认: 1234",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./results",
@@ -331,6 +337,21 @@ def parse_args():
         help="vLLM 普通 dense linear 输入激活 fake quant 格式。默认 none。",
     )
     parser.add_argument(
+        "--fp32_weights_bf16_activations",
+        action="store_true",
+        help="Linear 权重保持 FP32；层间激活保持 BF16，GEMM 前临时转 FP32，输出转回 BF16。",
+    )
+    parser.add_argument(
+        "--fp32_weights_fp32_activations",
+        action="store_true",
+        help="整个模型使用 FP32 权重和 FP32 激活运行。",
+    )
+    parser.add_argument(
+        "--use_chat_template",
+        action="store_true",
+        help="强制使用 tokenizer 的 chat template 构造评测 prompt。",
+    )
+    parser.add_argument(
         "--kv_quant_format",
         choices=["none", "nvfp4", "hif4", "hif4-1"],
         default="none",
@@ -365,6 +386,20 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.seed < 0:
+        raise ValueError("--seed 须为非负整数")
+    if (
+        args.fp32_weights_bf16_activations
+        and args.fp32_weights_fp32_activations
+    ):
+        raise ValueError("两种 FP32 权重模式不能同时启用")
+    if (
+        args.fp32_weights_bf16_activations
+        or args.fp32_weights_fp32_activations
+    ) and args.fake_act_quant != "none":
+        raise ValueError(
+            "FP32 权重基线不能同时设置 --fake_act_quant。"
+        )
     if args.kv_quant_format == "nvfp4" and args.kv_quant_chunk_size < 1:
         raise ValueError("--kv_quant_chunk_size 须为正整数")
     if args.kv_quant_sink_size < 0:
@@ -434,15 +469,23 @@ def main():
     pipeline_params = PipelineParameters(**kwargs)
 
     kv_quant_enabled = args.kv_quant_format != "none"
+    if args.fp32_weights_fp32_activations:
+        model_dtype = "float32"
+    elif args.fp32_weights_bf16_activations:
+        model_dtype = "bfloat16"
+    else:
+        model_dtype = "auto"
+
     vllm_model_kwargs = dict(
         model_name=args.model_path,
         trust_remote_code=True,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_length=args.max_model_length,
-        dtype="auto",
+        dtype=model_dtype,
         enforce_eager=args.enforce_eager,
         cpu_offload_gb=args.cpu_offload_gb,
+        seed=args.seed,
         generation_parameters=GenerationParameters(
             temperature=args.temperature,
             top_p=args.top_p,
@@ -450,7 +493,11 @@ def main():
             max_new_tokens=args.max_new_tokens,
         ),
     )
+    if args.use_chat_template:
+        vllm_model_kwargs["override_chat_template"] = True
     additional_config = {}
+    if args.fp32_weights_bf16_activations:
+        additional_config["fp32_weights_bf16_activations"] = True
     if args.fake_act_quant != "none":
         additional_config["fake_act_quant"] = args.fake_act_quant
     if args.fake_act_quant == "nvfp4":

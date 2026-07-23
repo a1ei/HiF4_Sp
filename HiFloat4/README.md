@@ -100,6 +100,16 @@ DTYPE=bfloat16 bash HiFloat4/quantize_qwen3_5_27b.sh
 # 改 HiF4 权重量化格式
 HIF4_WEIGHT_FORMAT=hif4-1 OUTPUT=/data/Qwen3.5-27B-HiF4-1-RTN bash HiFloat4/quantize_qwen3_5_27b.sh
 
+# NVFP4 RTN + SmoothQuant scale-only + NVFP4 激活 fake quant
+AWQ=false \
+SMOOTHQUANT=true \
+SMOOTHQUANT_SCALE_ONLY=true \
+HIF4_WEIGHT_FORMAT=nvfp4 \
+HIF4A=true \
+ACT_QUANT_FORMAT=nvfp4 \
+OUTPUT=/data/Qwen3.5-27B-NVFP4-RTN-SQScaleOnly-ACTNVFP4 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+
 # 使用 GPTQ 路径
 GPTQ=true \
 CAL_DATASET=c4 \
@@ -108,6 +118,8 @@ CAL_SEQLEN=512 \
 OUTPUT=/data/Qwen3.5-27B-HiF4-GPTQ \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
+
+`SMOOTHQUANT_SCALE_ONLY=true` 时只校准并应用 SmoothQuant scale，不再做 SmoothQuant 后的权重量化。Scale 已经写进前置 norm 和 Linear 权重，权重缩放不需要额外 scale 文件。`HIF4A=true` 的激活 fake quant 只在本次 `HiFloat4/main.py` 运行里生效，不会保存进普通 Hugging Face checkpoint。
 
 使用 s1K-1.1 `question + deepseek_thinking_trajectory + deepseek_attempt` 完整序列的前或后 2048 个 token：
 
@@ -121,7 +133,15 @@ OUTPUT=/data/Qwen3.5-27B-HiF4-s1k-tail-2048 \
 bash HiFloat4/quantize_qwen3_5_27b.sh
 ```
 
-长度不足的样本会被跳过，并继续选择后续样本；整个数据集无法凑够要求的样本数时才报错。
+使用 TACO train split 做校准时，loader 会先按 LiveCodeBench v6 test 的题面去重，再取 `question + starter_code + first_solution`；每条校准样本都从一个 `Question:` 开始，不够 `CAL_SEQLEN` 时继续拼接后续题目补足：
+
+```bash
+CAL_DATASET=taco CAL_SEQLEN=2048 CAL_SLICE_MODE=head \
+OUTPUT=/data/Qwen3.5-27B-HiF4-taco-head-2048 \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
+
+没有第一份 solution 的样本会被跳过；无法凑够要求的样本数时才报错。
 
 保存成功后，输出目录应包含：
 

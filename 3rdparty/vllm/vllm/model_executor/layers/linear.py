@@ -209,6 +209,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
             raise ValueError(f"Unsupported fake_act_quant: {self.fake_act_quant}")
         self.hif4_fake_act = self.fake_act_quant in ("hif4", "hif4-1")
         self.nvf4_fake_act = self.fake_act_quant == "nvfp4"
+        self.fp32_weights_bf16_activations = bool(
+            additional_config.get("fp32_weights_bf16_activations", False)
+        )
+        if self.fp32_weights_bf16_activations and self.fake_act_quant != "none":
+            raise ValueError(
+                "fp32_weights_bf16_activations cannot be combined with fake_act_quant"
+            )
         self.nvf4_activation_scales_path = additional_config.get(
             "nvf4_activation_scales_path"
         )
@@ -344,11 +351,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # The amount of memory allocated for the weights is
         # sum(output_partition_sizes) * input_size_per_partition.
         weight_loader = extra_weight_attrs.pop("weight_loader")
+        weight_dtype = (
+            torch.float32
+            if self.fp32_weights_bf16_activations and not self._skip_fake_act(layer)
+            else params_dtype
+        )
         weight = ModelWeightParameter(
             data=torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
-                dtype=params_dtype,
+                dtype=weight_dtype,
             ),
             input_dim=1,
             output_dim=0,
@@ -360,6 +372,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         self._setup_nvf4_fake_act(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.fp32_weights_bf16_activations and not self._skip_fake_act(layer):
+            if layer.weight.dtype != torch.float32:
+                raise TypeError(
+                    "FP32-weight/BF16-activation mode requires FP32 Linear weights, "
+                    f"got {layer.weight.dtype} for {getattr(layer, 'prefix', '')}"
+                )
         if self.nvf4_fake_act and not self._skip_nvf4_fake_act(layer):
             if not hasattr(layer, "_nvf4_input_global_scale"):
                 raise ValueError(
@@ -381,6 +399,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.fp32_weights_bf16_activations and not self._skip_fake_act(layer):
+            if x.dtype != torch.bfloat16:
+                raise TypeError(
+                    "FP32-weight/BF16-activation mode requires BF16 Linear inputs, "
+                    f"got {x.dtype} for {getattr(layer, 'prefix', '')}"
+                )
+            bias_fp32 = bias.to(torch.float32) if bias is not None else None
+            output = dispatch_unquantized_gemm()(
+                layer,
+                x.to(torch.float32),
+                layer.weight,
+                bias_fp32,
+            )
+            return output.to(torch.bfloat16)
         if self.hif4_fake_act and not self._skip_fake_act(layer):
             if self.fake_act_quant == "hif4":
                 x = hif4_fake.hif4_fake_quantize_hifx4(x)

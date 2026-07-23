@@ -1,0 +1,3 @@
+method,model,calibration_dataset,calibration_nsamples,calibration_seqlen,weight_format,weight_group_size,fake_activation_format,aime_seed1234,aime_seed1235,aime_seed1236,aime_seed1237,aime_seed1238,aime_mean,aime_sample_std,lcb_codegen_pass_at_1_16,lcb_stderr,mmlu_pro_extractive_match,mmlu_pro_stderr
+gptq,Qwen3.5-27B-HiF4-GPTQ_taco_head_128_4096,taco,128,4096,hif4_hifx4,64,hif4,0.7000,0.8333,0.8333,0.8000,0.7333,0.780000,0.060553,0.4057,0.0372,0.8540,0.0064
+magr,Qwen3.5-27B-HiF4-MagR_taco_head_128_4096,taco,128,4096,hif4_hifx4,64,hif4,0.6667,0.8000,0.7667,0.8333,0.7333,0.760000,0.064117,0.3486,0.0361,0.8443,0.0066

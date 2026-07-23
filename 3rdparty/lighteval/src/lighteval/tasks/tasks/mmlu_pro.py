@@ -50,13 +50,13 @@ def mmlu_pro_prompt_function(line, task_name: str = None):
     if not 2 <= len(options) <= len(ascii_uppercase):
         raise ValueError(f"MMLU-Pro requires 2 to 26 options, got {len(options)}.")
     answer_letters = ascii_uppercase[: len(options)]
-    formatted_choices = "\n".join(
+    choices = "\n".join(
         f"{letter}: {option}" for letter, option in zip(answer_letters, options)
     )
 
     query = TEMPLATE.format(
         question=line["question"],
-        choices=formatted_choices,
+        choices=choices,
         answer_letters=", ".join(answer_letters),
     )
 
@@ -85,7 +85,6 @@ mmlu_pro = LightevalTaskConfig(
     evaluation_splits=("test",),
     few_shots_split="validation",
     metrics=[Metrics.gpqa_instruct_metric],
-    version=1,
 )
 
 TASKS_TABLE = [mmlu_pro]
