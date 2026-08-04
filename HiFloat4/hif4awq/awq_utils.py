@@ -14,9 +14,13 @@ if str(HIF4GPTQ_ROOT) not in sys.path:
     sys.path.append(str(HIF4GPTQ_ROOT))
 
 from gptq.gptq_utils import (
+    _compute_fp_token_entropy,
+    _compute_layer_local_token_weights,
     _get_layers,
     _is_qwen3_5_text_model,
     _layer_kwargs_for_current_layer,
+    _local_importance_group_for_linear,
+    _normalize_entropy_importance,
     _run_layer,
     _validate_no_padding_attention_mask,
     find_qlayers,
@@ -52,7 +56,17 @@ def _get_op_name(module: nn.Module, op: nn.Module) -> str:
 
 @torch.no_grad()
 def _get_act_scale(x: torch.Tensor) -> torch.Tensor:
-    return x.abs().view(-1, x.shape[-1]).mean(0)
+    if x.ndim < 2 or x.shape[-1] == 0:
+        raise ValueError("AWQ activation tensor must have a non-empty feature dimension.")
+    feature_sum = torch.zeros(x.shape[-1], dtype=torch.float32, device="cpu")
+    token_count = 0
+    for start in range(0, x.shape[0], _AWQ_SEARCH_BATCH_SIZE):
+        chunk = x[start : start + _AWQ_SEARCH_BATCH_SIZE].detach().cpu().float()
+        feature_sum += chunk.abs().reshape(-1, x.shape[-1]).sum(dim=0)
+        token_count += chunk.numel() / x.shape[-1]
+    if token_count == 0:
+        raise ValueError("AWQ activation tensor contains zero tokens.")
+    return (feature_sum / token_count).to(dtype=x.dtype)
 
 
 def _module_output(output):
@@ -60,15 +74,56 @@ def _module_output(output):
         return output[0]
     return output
 
-_AWQ_SEARCH_BATCH_SIZE = 32
+_AWQ_SEARCH_BATCH_SIZE = 16
 @torch.no_grad()
 def _module_output_minibatch(block: nn.Module, x: torch.Tensor, kwargs: dict) -> torch.Tensor:
     outs = []
     for start in range(0, x.shape[0], _AWQ_SEARCH_BATCH_SIZE):
         end = min(start + _AWQ_SEARCH_BATCH_SIZE, x.shape[0])
-        out = _module_output(block(x[start:end], **kwargs))
+        device = next(block.parameters()).device
+        chunk = x[start:end].to(device)
+        out = _module_output(block(chunk, **kwargs))
         outs.append(out.detach().cpu())
     return torch.cat(outs, dim=0)
+
+
+@torch.no_grad()
+def _module_reconstruction_loss_minibatch(
+    block: nn.Module,
+    x: torch.Tensor,
+    kwargs: dict,
+    org_out: torch.Tensor,
+    token_weights: torch.Tensor | None,
+) -> float:
+    device = next(block.parameters()).device
+    error_sum = torch.zeros((), dtype=torch.float32, device=device)
+    normalizer = torch.zeros((), dtype=torch.float32, device=device)
+
+    for start in range(0, x.shape[0], _AWQ_SEARCH_BATCH_SIZE):
+        end = min(start + _AWQ_SEARCH_BATCH_SIZE, x.shape[0])
+        chunk = x[start:end].to(device)
+        out = _module_output(block(chunk, **kwargs))
+        token_error = (org_out[start:end].to(device) - out).float().pow(2)
+        while token_error.ndim > 2:
+            token_error = token_error.mean(dim=-1)
+
+        if token_weights is None:
+            error_sum += token_error.sum()
+            normalizer += token_error.numel()
+            continue
+
+        weights = token_weights[start:end].to(device, token_error.dtype)
+        if weights.shape != token_error.shape:
+            raise ValueError(
+                f"AWQ token weight shape {tuple(weights.shape)} does not match "
+                f"reconstruction error shape {tuple(token_error.shape)}."
+            )
+        error_sum += (token_error * weights).sum()
+        normalizer += weights.sum()
+
+    if not torch.isfinite(normalizer) or normalizer <= 0:
+        raise ValueError("AWQ reconstruction loss must have a positive finite normalizer.")
+    return (error_sum / normalizer).item()
 
 
 def _module_kwargs_for_inspect(module_name: str, layer_kwargs: dict) -> dict:
@@ -106,11 +161,12 @@ def _search_module_scale(
     kwargs: dict,
     qparams: QType,
     n_grid: int,
+    token_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if n_grid <= 0:
         raise ValueError("AWQ n_grid must be positive.")
 
-    x = x.to(next(block.parameters()).device)
+    x = x.detach().cpu()
     org_out = _module_output_minibatch(block, x, kwargs)
     x_max = _get_act_scale(x)
 
@@ -136,8 +192,9 @@ def _search_module_scale(
                 / scales.view(1, -1).to(fc.weight.device)
             )
 
-        out = _module_output_minibatch(block, x, kwargs)
-        loss = (org_out - out).float().pow(2).mean().item()
+        loss = _module_reconstruction_loss_minibatch(
+            block, x, kwargs, org_out, token_weights
+        )
         history.append(loss)
         if loss < best_error:
             best_error = loss
@@ -162,6 +219,7 @@ def _auto_get_scale(
     n_grid: int,
     module2inspect: nn.Module | None = None,
     kwargs: dict | None = None,
+    token_weights: torch.Tensor | None = None,
 ) -> tuple[str, tuple[str, ...], torch.Tensor]:
     if kwargs is None:
         kwargs = {}
@@ -177,6 +235,7 @@ def _auto_get_scale(
         kwargs,
         qparams,
         n_grid,
+        token_weights,
     )
     return (
         _get_op_name(module, prev_op),
@@ -198,6 +257,8 @@ def _auto_scale_block(
     layer_kwargs: dict,
     qparams: QType,
     n_grid: int,
+    token_weights: torch.Tensor | None = None,
+    group_token_weights: dict[str, torch.Tensor] | None = None,
 ) -> list[tuple[str, tuple[str, ...], torch.Tensor]]:
     model_type = getattr(model.config, "model_type", "")
     scales_list = []
@@ -219,6 +280,11 @@ def _auto_scale_block(
                 n_grid=n_grid,
                 module2inspect=module2inspect,
                 kwargs=kwargs_for(inspect_name),
+                token_weights=(
+                    group_token_weights[_local_importance_group_for_linear(inp_name)]
+                    if group_token_weights is not None
+                    else token_weights
+                ),
             )
         )
 
@@ -464,6 +530,26 @@ def awq_fwrd(model, dataloader, dev, args):
         torch.cuda.empty_cache()
 
     layer_kwargs = {k: v for k, v in cache.items() if k != "i"}
+    valid_token_mask = torch.ones((nsamples, args.cal_seqlen), dtype=torch.bool)
+    token_importance = getattr(args, "token_importance", "none")
+    token_weights = None
+    layer_local_weights = None
+    if token_importance == "entropy":
+        entropy = _compute_fp_token_entropy(model, layers, inps.cpu(), layer_kwargs, device)
+        token_weights = _normalize_entropy_importance(
+            entropy, valid_token_mask, alpha=args.entropy_alpha, norm_mode=args.entropy_norm
+        )
+        del entropy
+    elif token_importance == "entropy_grad":
+        layer_local_weights = _compute_layer_local_token_weights(
+            model, layers, inps.cpu(), layer_kwargs, valid_token_mask, device,
+            alpha=args.importance_alpha,
+            mean_normalize=args.importance_mean_normalize,
+            batch_size=args.importance_batch_size,
+        )
+    elif token_importance != "none":
+        raise ValueError(f"Unsupported AWQ token importance mode: {token_importance}")
+    logging.info("AWQ token-importance reconstruction mode: %s", token_importance)
     weight_qtype = getattr(args, "hif4_weight_qtype", "hifx4")
     qparams = QType(weight_qtype).dim(-1)
     exclude_layers = getattr(args, "exclude_layers", ["lm_head"])
@@ -520,6 +606,10 @@ def awq_fwrd(model, dataloader, dev, args):
             search_layer_kwargs,
             qparams,
             n_grid,
+            token_weights=token_weights,
+            group_token_weights=(
+                layer_local_weights[i] if layer_local_weights is not None else None
+            ),
         )
         _apply_scale(layer, scales_list, input_feat_dict=input_feat)
         layer = layer.to(device)

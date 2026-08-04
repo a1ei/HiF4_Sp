@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Train a rank-1 lm_head adapter that only changes the </think> logit."""
+
+import argparse
+import json
+import math
+import os
+import random
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from safetensors.torch import save_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+END_THINK_TEXT = "</think>"
+START_THINK_TEXT = "<think>"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Distill a single-token </think> adapter from a full-precision teacher."
+    )
+    parser.add_argument("--student_model", required=True)
+    parser.add_argument("--teacher_model", default="Qwen/Qwen3.5-27B")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--cache_dir", default=None)
+    parser.add_argument("--dataset", default="simplescaling/s1K-1.1")
+    parser.add_argument("--nsamples", type=int, default=128)
+    parser.add_argument("--max_length", type=int, default=16384)
+    parser.add_argument("--num_negative_positions", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--teacher_device", default="cuda:1")
+    parser.add_argument("--student_device", default="cuda:0")
+    parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
+    parser.add_argument("--attn_implementation", default="sdpa")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--train_samples", type=int, default=None)
+    parser.add_argument(
+        "--phase",
+        choices=["all", "prepare", "teacher", "student", "train"],
+        default="all",
+        help="Run the complete pipeline or one resumable stage.",
+    )
+    return parser.parse_args()
+
+
+def _single_token_id(tokenizer, text):
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(f"{text!r} must encode to one token, got {ids}.")
+    return ids[0]
+
+
+def _evenly_spaced_positions(start, stop, count):
+    """Return exactly count distinct integer positions in inclusive [start, stop]."""
+    available = stop - start + 1
+    if available < count:
+        raise ValueError(
+            f"Thinking trajectory has only {available} eligible negative positions; "
+            f"{count} are required."
+        )
+    if count == 1:
+        return [start + available // 2]
+    return [
+        start + (i * (available - 1)) // (count - 1)
+        for i in range(count)
+    ]
+
+
+def build_examples(args, tokenizer, cache_path):
+    start_id = _single_token_id(tokenizer, START_THINK_TEXT)
+    end_id = _single_token_id(tokenizer, END_THINK_TEXT)
+    dataset = load_dataset(args.dataset, split="train")
+    indices = list(range(len(dataset)))
+    random.Random(args.seed).shuffle(indices)
+
+    examples = []
+    for source_index in indices:
+        row = dataset[source_index]
+        question = row.get("question")
+        thinking = row.get("deepseek_thinking_trajectory")
+        attempt = row.get("deepseek_attempt")
+        if not all(isinstance(x, str) and x.strip() for x in (question, thinking, attempt)):
+            raise ValueError(f"Dataset sample {source_index} has an invalid required field.")
+
+        messages = [
+            {"role": "user", "content": question.strip()},
+            {
+                "role": "assistant",
+                "content": (
+                    f"{START_THINK_TEXT}\n{thinking.strip()}\n"
+                    f"{END_THINK_TEXT}\n\n{attempt.strip()}"
+                ),
+            },
+        ]
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=True,
+        )
+        input_ids = tokenizer(
+            rendered,
+            add_special_tokens=False,
+        ).input_ids
+        if len(input_ids) > args.max_length:
+            continue
+
+        start_indices = [i for i, token_id in enumerate(input_ids) if token_id == start_id]
+        end_indices = [i for i, token_id in enumerate(input_ids) if token_id == end_id]
+        if len(start_indices) != 1 or len(end_indices) != 1:
+            raise ValueError(
+                f"Dataset sample {source_index} must contain exactly one think pair; "
+                f"got starts={start_indices}, ends={end_indices}."
+            )
+        start_index = start_indices[0]
+        end_index = end_indices[0]
+        if end_index <= start_index + 2:
+            raise ValueError(f"Dataset sample {source_index} has an empty thinking trajectory.")
+
+        positive_position = end_index - 1
+        negative_positions = _evenly_spaced_positions(
+            start_index + 1,
+            end_index - 2,
+            args.num_negative_positions,
+        )
+        if input_ids[positive_position + 1] != end_id:
+            raise RuntimeError("Positive position does not predict </think>.")
+        if any(input_ids[position + 1] == end_id for position in negative_positions):
+            raise RuntimeError("A negative position predicts </think>.")
+
+        examples.append(
+            {
+                "source_index": source_index,
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "positions": torch.tensor(
+                    [positive_position, *negative_positions], dtype=torch.long
+                ),
+            }
+        )
+        if len(examples) == args.nsamples:
+            break
+
+    if len(examples) != args.nsamples:
+        raise ValueError(
+            f"Only {len(examples)} complete samples fit max_length={args.max_length}; "
+            f"{args.nsamples} are required."
+        )
+    payload = {
+        "examples": examples,
+        "end_think_token_id": end_id,
+        "start_think_token_id": start_id,
+        "num_negative_positions": args.num_negative_positions,
+        "max_length": args.max_length,
+        "dataset": args.dataset,
+        "seed": args.seed,
+    }
+    torch.save(payload, cache_path)
+    print(f"Prepared {len(examples)} samples at {cache_path}.")
+    return payload
+
+
+def _dtype_from_name(name):
+    return {"float16": torch.float16, "bfloat16": torch.bfloat16}[name]
+
+
+def _binary_log_odds(logits, target_id):
+    logits = logits.float()
+    target = logits[:, target_id]
+    other_logits = logits.clone()
+    other_logits[:, target_id] = -torch.inf
+    return target - torch.logsumexp(other_logits, dim=-1)
+
+
+def _target_top1_margin(logits, target_id):
+    logits = logits.float()
+    target = logits[:, target_id]
+    other_logits = logits.clone()
+    other_logits[:, target_id] = -torch.inf
+    return target - other_logits.max(dim=-1).values
+
+
+def extract_features(args, model_path, device, examples_payload, output_path, student):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=_dtype_from_name(args.dtype),
+        device_map={"": device},
+        attn_implementation=args.attn_implementation,
+        trust_remote_code=False,
+    )
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    all_scores = []
+    all_hidden = []
+    all_top1_margins = []
+    target_id = examples_payload["end_think_token_id"]
+    with torch.inference_mode():
+        for index, example in enumerate(examples_payload["examples"]):
+            input_ids = example["input_ids"].unsqueeze(0).to(device)
+            positions = example["positions"].to(device)
+            outputs = model.model(
+                input_ids=input_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            selected_hidden = outputs.last_hidden_state[0].index_select(0, positions)
+            selected_logits = model.lm_head(selected_hidden)
+            all_scores.append(_binary_log_odds(selected_logits, target_id).cpu())
+            if student:
+                all_hidden.append(selected_hidden.float().cpu())
+                all_top1_margins.append(_target_top1_margin(selected_logits, target_id).cpu())
+            print(
+                f"{'Student' if student else 'Teacher'} features: "
+                f"{index + 1}/{len(examples_payload['examples'])}"
+            )
+
+    payload = {
+        "scores": torch.stack(all_scores),
+        "source_indices": [
+            example["source_index"] for example in examples_payload["examples"]
+        ],
+        "end_think_token_id": target_id,
+    }
+    if student:
+        payload["hidden_states"] = torch.stack(all_hidden)
+        payload["top1_margins"] = torch.stack(all_top1_margins)
+        payload["hidden_size"] = model.config.hidden_size
+        payload["vocab_size"] = model.config.vocab_size
+    torch.save(payload, output_path)
+    print(f"Saved features to {output_path}.")
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _balanced_binary_loss(scores, targets):
+    positive = F.binary_cross_entropy_with_logits(scores[:, 0], targets[:, 0])
+    negative = F.binary_cross_entropy_with_logits(scores[:, 1:], targets[:, 1:])
+    return 0.5 * (positive + negative)
+
+
+def _metrics(scores, top1_margins):
+    probabilities = scores.sigmoid()
+    return {
+        "positive_probability": probabilities[:, 0].mean().item(),
+        "negative_probability": probabilities[:, 1:].mean().item(),
+        "positive_top1_rate": (top1_margins[:, 0] > 0).float().mean().item(),
+        "negative_false_positive_rate": (top1_margins[:, 1:] > 0).float().mean().item(),
+    }
+
+
+def train_adapter(args, examples_path, teacher_path, student_path):
+    examples = torch.load(examples_path, map_location="cpu", weights_only=False)
+    teacher = torch.load(teacher_path, map_location="cpu", weights_only=False)
+    student = torch.load(student_path, map_location="cpu", weights_only=False)
+    expected_indices = [x["source_index"] for x in examples["examples"]]
+    if teacher["source_indices"] != expected_indices or student["source_indices"] != expected_indices:
+        raise ValueError("Teacher/student feature caches do not match prepared examples.")
+    if teacher["end_think_token_id"] != examples["end_think_token_id"]:
+        raise ValueError("Teacher target token does not match prepared examples.")
+    if student["end_think_token_id"] != examples["end_think_token_id"]:
+        raise ValueError("Student target token does not match prepared examples.")
+
+    nsamples = len(expected_indices)
+    train_samples = args.train_samples
+    if train_samples is None:
+        train_samples = nsamples - max(1, nsamples // 8)
+    if not 1 <= train_samples < nsamples:
+        raise ValueError("--train_samples must leave at least one validation sample.")
+
+    generator = torch.Generator().manual_seed(args.seed)
+    permutation = torch.randperm(nsamples, generator=generator)
+    train_indices = permutation[:train_samples]
+    validation_indices = permutation[train_samples:]
+    device = torch.device(args.student_device)
+    hidden = student["hidden_states"].to(device)
+    student_scores = student["scores"].to(device)
+    teacher_scores = teacher["scores"].to(device)
+    weight = torch.nn.Parameter(torch.zeros(student["hidden_size"], device=device))
+    optimizer = torch.optim.AdamW(
+        [weight], lr=args.learning_rate, weight_decay=0.0
+    )
+
+    def loss_for(indices):
+        correction = torch.einsum("nph,h->np", hidden[indices], weight)
+        corrected_scores = student_scores[indices] + correction
+        teacher_targets = teacher_scores[indices].sigmoid()
+        hard_targets = torch.zeros_like(corrected_scores)
+        hard_targets[:, 0] = 1
+        distillation_loss = _balanced_binary_loss(corrected_scores, teacher_targets)
+        hard_label_loss = _balanced_binary_loss(corrected_scores, hard_targets)
+        return distillation_loss + hard_label_loss, corrected_scores
+
+    best_loss = math.inf
+    best_weight = None
+    for epoch in range(args.epochs):
+        optimizer.zero_grad(set_to_none=True)
+        train_loss, _ = loss_for(train_indices)
+        train_loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            validation_loss, _ = loss_for(validation_indices)
+        print(
+            f"Epoch {epoch + 1}/{args.epochs}: "
+            f"train_loss={train_loss.item():.6f}, "
+            f"validation_loss={validation_loss.item():.6f}"
+        )
+        if validation_loss.item() < best_loss:
+            best_loss = validation_loss.item()
+            best_weight = weight.detach().cpu().clone()
+
+    if best_weight is None:
+        raise RuntimeError("Training did not produce a checkpoint.")
+    with torch.no_grad():
+        before = student_scores[validation_indices]
+        after = before + torch.einsum(
+            "nph,h->np",
+            hidden[validation_indices],
+            best_weight.to(device),
+        )
+        correction = after - before
+        before_top1_margins = student["top1_margins"].to(device)[validation_indices]
+        after_top1_margins = before_top1_margins + correction
+    metrics = {
+        "before": _metrics(before, before_top1_margins),
+        "after": _metrics(after, after_top1_margins),
+        "best_validation_loss": best_loss,
+        "train_source_indices": [expected_indices[i] for i in train_indices.tolist()],
+        "validation_source_indices": [
+            expected_indices[i] for i in validation_indices.tolist()
+        ],
+    }
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lora_a = best_weight.reshape(1, -1).to(torch.bfloat16).contiguous()
+    lora_b = torch.zeros(
+        student["vocab_size"], 1, dtype=torch.bfloat16
+    )
+    lora_b[examples["end_think_token_id"], 0] = 1
+    save_file(
+        {
+            "base_model.model.lm_head.lora_A.weight": lora_a,
+            "base_model.model.lm_head.lora_B.weight": lora_b,
+        },
+        output_dir / "adapter_model.safetensors",
+    )
+    adapter_config = {
+        "peft_type": "LORA",
+        "base_model_name_or_path": os.path.abspath(args.student_model),
+        "task_type": "CAUSAL_LM",
+        "inference_mode": True,
+        "r": 1,
+        "lora_alpha": 1,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "target_modules": ["lm_head"],
+    }
+    with open(output_dir / "adapter_config.json", "w", encoding="utf-8") as handle:
+        json.dump(adapter_config, handle, indent=2, ensure_ascii=False)
+    with open(output_dir / "training_metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2, ensure_ascii=False)
+    print(json.dumps(metrics, indent=2, ensure_ascii=False))
+    print(f"Saved adapter to {output_dir}.")
+
+
+def main():
+    args = parse_args()
+    if args.nsamples < 2:
+        raise ValueError("--nsamples must be at least 2.")
+    if args.num_negative_positions < 1:
+        raise ValueError("--num_negative_positions must be positive.")
+    if args.max_length < 1 or args.epochs < 1 or args.learning_rate <= 0:
+        raise ValueError("Length, epochs, and learning rate must be positive.")
+
+    cache_dir = Path(args.cache_dir or (Path(args.output_dir) / "feature_cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    examples_path = cache_dir / "examples.pt"
+    teacher_path = cache_dir / "teacher_features.pt"
+    student_path = cache_dir / "student_features.pt"
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.student_model,
+        use_fast=False,
+        trust_remote_code=False,
+    )
+    if args.phase in {"all", "prepare"}:
+        examples = build_examples(args, tokenizer, examples_path)
+    else:
+        examples = torch.load(examples_path, map_location="cpu", weights_only=False)
+
+    if args.phase in {"all", "teacher"}:
+        extract_features(
+            args, args.teacher_model, args.teacher_device, examples, teacher_path, False
+        )
+    if args.phase in {"all", "student"}:
+        extract_features(
+            args, args.student_model, args.student_device, examples, student_path, True
+        )
+    if args.phase in {"all", "train"}:
+        train_adapter(args, examples_path, teacher_path, student_path)
+
+
+if __name__ == "__main__":
+    main()

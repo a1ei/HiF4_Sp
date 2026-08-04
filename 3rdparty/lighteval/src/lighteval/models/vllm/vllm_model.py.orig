@@ -216,9 +216,6 @@ class VLLMModel(LightevalModel):
     ):
         """Initializes a HuggingFace `AutoModel` and `AutoTokenizer` for evaluation."""
         self.config = config
-        self.max_lora_rank = (
-            _adapter_max_lora_rank(config.lora_path) if config.lora_path else None
-        )
         self.lora_request = (
             LoRARequest("lighteval_adapter", 1, os.path.abspath(config.lora_path))
             if config.lora_path

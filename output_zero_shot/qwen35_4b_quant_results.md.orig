@@ -1,0 +1,114 @@
+# Qwen3.5-4B 零样本量化评测汇总
+
+## 1. 数据来源
+
+- `output_zero_shot/qwen35_4b_quant_comparison`
+- `output_zero_shot/qwen35_4b_omniquant`
+- `output_zero_shot/qwen35_4b_entropy_grad_awq_lora`
+
+评测包含三个任务，所有指标均为越高越好：
+
+- AIME25：`avg@n:n=5`
+- LiveCodeBench v6：`codegen_pass@1:16`
+- MMLU-Pro：`extractive_match`
+
+量化模型名称显示，校准统一使用 `s1k-1.1`、`head` 切片、512 个样本、4096 token。BF16 为原始 `Qwen/Qwen3.5-4B`。
+
+## 2. 完整结果
+
+表中数值为日志中的原始得分，括号内为标准误。`W4A16` 表示 4 bit 权重、16 bit 激活；`W4A4` 表示 4 bit 权重、4 bit 激活。
+
+| 方法 | 精度 | AIME25 | LiveCodeBench v6 | MMLU-Pro | 状态 |
+|---|---:|---:|---:|---:|---|
+| BF16 | BF16 | **0.5667** (0.0762) | **0.3543** (0.0363) | **0.7890** (0.0129) | 完成 |
+| GPTQ | W4A16 | 0.6000 (0.0685) | 0.2800 (0.0340) | **0.7990** (0.0127) | 完成 |
+| GPTQ + end-think LoRA | W4A16 | **0.6200** (0.0713) | 0.2857 (0.0342) | 0.7870 (0.0130) | 完成 |
+| LFQ | W4A16 | 0.5600 (0.0701) | 0.2400 (0.0324) | 0.7730 (0.0133) | 完成 |
+| GPTQ + entropy-grad | W4A16 | 0.5133 (0.0696) | 0.3029 (0.0348) | 0.7890 (0.0129) | 完成 |
+| GPTQ + entropy-grad + end-think LoRA | W4A16 | 0.6000 (0.0779) | 0.3257 (0.0355) | 0.7800 (0.0131) | 完成 |
+| GPTQ + entropy-grad-norm | W4A16 | 0.5867 (0.0761) | 0.2743 (0.0338) | 0.7840 (0.0130) | 完成 |
+| GPTQ + entropy-grad-norm + end-think LoRA | W4A16 | 0.5933 (0.0708) | **0.3371** (0.0358) | 0.7870 (0.0130) | 完成 |
+| MagR | W4A16 | 0.3333 (0.0646) | 0.0743 (0.0199) | 0.6920 (0.0146) | 完成 |
+| OmniQuant | W4A16 | 0.3667 (0.0692) | 0.2057 (0.0306) | 0.7800 (0.0131) | 完成 |
+| GPTQ | W4A4 | 0.4400 (0.0751) | 0.2171 (0.0313) | 0.7660 (0.0134) | 完成 |
+| GPTQ + end-think LoRA | W4A4 | 0.4933 (0.0766) | 0.2229 (0.0315) | 0.7640 (0.0134) | 完成 |
+| LFQ | W4A4 | 0.3733 (0.0683) | 0.1714 (0.0286) | 0.7500 (0.0137) | 完成 |
+| GPTQ + entropy-grad | W4A4 | **0.5133** (0.0747) | 0.2057 (0.0306) | 0.7650 (0.0134) | 完成 |
+| GPTQ + entropy-grad + end-think LoRA | W4A4 | 0.4800 (0.0728) | 0.2343 (0.0321) | 0.7680 (0.0134) | 完成 |
+| GPTQ + entropy-grad-norm | W4A4 | 0.5067 (0.0772) | **0.2400** (0.0324) | **0.7780** (0.0131) | 完成 |
+| GPTQ + entropy-grad-norm + end-think LoRA | W4A4 | 0.5000 (0.0795) | 0.2171 (0.0313) | **0.7780** (0.0131) | 完成 |
+| OmniQuant | W4A4 | 0.2667 (0.0594) | 0.1486 (0.0270) | 0.7530 (0.0136) | 完成 |
+| MagR | W4A4 | 0.2067 (0.0563) | 0.0457 (0.0158) | 0.6330 (0.0152) | 完成 |
+
+粗体表示同一精度组中的最高值；BF16 单独作为基线。
+
+## 3. 相对 BF16 的变化
+
+以下为绝对分数差，即“量化模型得分 - BF16 得分”。
+
+| 方法 | 精度 | AIME25 | LiveCodeBench v6 | MMLU-Pro |
+|---|---:|---:|---:|---:|
+| GPTQ | W4A16 | +0.0333 | -0.0743 | +0.0100 |
+| GPTQ + end-think LoRA | W4A16 | +0.0533 | -0.0686 | -0.0020 |
+| LFQ | W4A16 | -0.0067 | -0.1143 | -0.0160 |
+| GPTQ + entropy-grad | W4A16 | -0.0534 | -0.0514 | +0.0000 |
+| GPTQ + entropy-grad + end-think LoRA | W4A16 | +0.0333 | -0.0286 | -0.0090 |
+| GPTQ + entropy-grad-norm | W4A16 | +0.0200 | -0.0800 | -0.0050 |
+| GPTQ + entropy-grad-norm + end-think LoRA | W4A16 | +0.0266 | -0.0172 | -0.0020 |
+| MagR | W4A16 | -0.2334 | -0.2800 | -0.0970 |
+| OmniQuant | W4A16 | -0.2000 | -0.1486 | -0.0090 |
+| GPTQ | W4A4 | -0.1267 | -0.1372 | -0.0230 |
+| GPTQ + end-think LoRA | W4A4 | -0.0734 | -0.1314 | -0.0250 |
+| LFQ | W4A4 | -0.1934 | -0.1829 | -0.0390 |
+| GPTQ + entropy-grad | W4A4 | -0.0534 | -0.1486 | -0.0240 |
+| GPTQ + entropy-grad + end-think LoRA | W4A4 | -0.0867 | -0.1200 | -0.0210 |
+| GPTQ + entropy-grad-norm | W4A4 | -0.0600 | -0.1143 | -0.0110 |
+| GPTQ + entropy-grad-norm + end-think LoRA | W4A4 | -0.0667 | -0.1372 | -0.0110 |
+| OmniQuant | W4A4 | -0.3000 | -0.2057 | -0.0360 |
+| MagR | W4A4 | -0.3600 | -0.3086 | -0.1560 |
+
+## 4. 结果观察
+
+1. W4A16 中，原始 GPTQ + end-think LoRA 的 AIME25 最高，GPTQ + entropy-grad-norm + end-think LoRA 的 LiveCodeBench 最高，原始 GPTQ 的 MMLU-Pro 最高并略高于 BF16。
+2. W4A4 中，GPTQ + entropy-grad 的 AIME25 最高，GPTQ + entropy-grad-norm 的 LiveCodeBench 最高；entropy-grad-norm 及其 LoRA 版本并列取得最高 MMLU-Pro。
+3. 从 W4A16 降至 W4A4 后，所有同时具备两组结果的方法均出现下降。GPTQ 的三项变化分别为 -0.1600、-0.0629、-0.0330。
+4. end-think LoRA 相对原始 GPTQ 提升了 AIME25 和 LiveCodeBench，但 MMLU-Pro 略降：W4A16 分别变化 +0.0200、+0.0057、-0.0120；W4A4 分别变化 +0.0533、+0.0058、-0.0020。
+5. MagR 在本次三个任务上的损失最大，特别是 LiveCodeBench；W4A4 下得分由 BF16 的 0.3543 降至 0.0457。
+6. 纯 OmniQuant 的 W4A16 三项结果为 0.3667、0.2057、0.7800；切换到 W4A4 后分别下降 0.1000、0.0571、0.0270。
+7. entropy-grad-norm 在 W4A4 上整体优于普通 GPTQ；其 end-think LoRA 在 W4A16 上把 LiveCodeBench 从 0.2743 提升到 0.3371，但 W4A4 下没有保持这一提升。
+
+## 5. OmniQuant 配置与日志状态
+
+`quant_omniquant.log` 记录的主要配置如下：
+
+| 配置项 | 值 |
+|---|---|
+| 基础模型 | `Qwen/Qwen3.5-4B` |
+| 保存模型 | `Qmodel/Qwen3.5-4B-HiF4-OmniQuant-W4A16-s1k-head-512x4096` |
+| 权重/激活位宽 | W4A16 |
+| 权重量化格式 | HiF4 |
+| 校准数据 | `s1k-1.1` |
+| 校准样本数 | 512 |
+| 校准长度 | 4096 |
+| 校准切片 | `head` |
+| 训练轮数 | 10 |
+| LET / LWC | 开启 / 开启 |
+| LFQ | 关闭 |
+| 数据类型 | BF16 |
+
+量化从 2026-08-03 00:28 开始，32 层全部处理并于 07:57 保存成功。
+
+`eval_w4a16.log` 已完成并产出三项指标：AIME25 0.3667、LiveCodeBench v6 0.2057、MMLU-Pro 0.7800。
+
+`eval_w4a4.log` 已完成并产出三项指标，但日志加载的 checkpoint 名仍为 `...OmniQuant-W4A16...`。这与其他方法的 W4A4 日志行为一致：W4A4 评测复用 W4A16 权重 checkpoint，再在评测阶段处理 4 bit 激活。仅从当前日志看不到明确的激活量化开关输出，因此表中的“W4A4”按日志文件和结果目录分类记录。
+
+## 6. 原始日志对应关系
+
+| 方法 | 日志 |
+|---|---|
+| BF16 | `qwen35_4b_quant_comparison/bf16/bf16.log` |
+| GPTQ | `qwen35_4b_quant_comparison/gptq/w4a16.log`, `w4a4.log` |
+| GPTQ + end-think LoRA | `qwen35_4b_quant_comparison/gptq_end_think_lora/w4a16.log`, `w4a4.log` |
+| LFQ | `qwen35_4b_quant_comparison/lfq/w4a16.log`, `w4a4.log` |
+| MagR | `qwen35_4b_quant_comparison/magr/w4a16.log`, `w4a4.log` |
+| OmniQuant | `qwen35_4b_omniquant/eval_w4a16.log`, `eval_w4a4.log`, `quant_omniquant.log` |

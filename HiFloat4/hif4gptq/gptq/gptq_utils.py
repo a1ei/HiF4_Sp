@@ -56,11 +56,29 @@ def _run_layer(layer, hidden_states, layer_kwargs):
 def _get_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "layers")
+    ):
+        return model.model.language_model.layers
     raise NotImplementedError("Only decoder-only models with model.layers are supported.")
 
 
 def _is_qwen3_5_text_model(model):
-    return getattr(model.config, "model_type", "") == "qwen3_5_text"
+    return getattr(model.config, "model_type", "") in {"qwen3_5", "qwen3_5_text"}
+
+
+def _get_final_norm(model):
+    if hasattr(model, "model") and hasattr(model.model, "norm"):
+        return model.model.norm
+    if (
+        hasattr(model, "model")
+        and hasattr(model.model, "language_model")
+        and hasattr(model.model.language_model, "norm")
+    ):
+        return model.model.language_model.norm
+    return None
 
 
 def _get_quant_groups(model, layer=None):
@@ -222,6 +240,7 @@ def _capture_calibration_inputs(model, layers, dataloader, device, max_samples, 
     return inps[:nsamples], layer_kwargs, valid_token_mask[:nsamples]
 
 
+@torch.no_grad()
 def _compute_fp_token_entropy(model, layers, inps, layer_kwargs, device, logits_chunk_size=128):
     """Run a layer-wise FP forward and return next-token entropy on CPU."""
     logging.info("Computing FP next-token entropy before GPTQ quantization.")
@@ -243,7 +262,7 @@ def _compute_fp_token_entropy(model, layers, inps, layer_kwargs, device, logits_
             torch.cuda.empty_cache()
         fp_inps, fp_outs = fp_outs, fp_inps
 
-    norm = getattr(model.model, "norm", None)
+    norm = _get_final_norm(model)
     output_head = model.get_output_embeddings()
     if output_head is None:
         raise RuntimeError("Entropy-weighted GPTQ requires a causal LM output embedding layer.")
@@ -372,12 +391,18 @@ def _local_importance_representatives(layer):
     return {group: full[name] for group, name in names.items()}
 
 
-def _activation_gradient_importance(activation, gradient):
+def _activation_gradient_importance(activation, gradient, mode="entropy_grad"):
     if activation.shape != gradient.shape:
         raise RuntimeError(
             f"Activation shape {tuple(activation.shape)} does not match gradient shape {tuple(gradient.shape)}."
         )
-    importance = torch.linalg.vector_norm(activation.float() * gradient.float(), dim=-1)
+    if mode == "entropy_grad":
+        signal = activation.float() * gradient.float()
+    elif mode == "entropy_grad_norm":
+        signal = gradient.float()
+    else:
+        raise ValueError(f"Unsupported layer-local importance mode: {mode}")
+    importance = torch.linalg.vector_norm(signal, dim=-1)
     if importance.ndim == 1:
         importance = importance.unsqueeze(0)
     if importance.ndim != 2:
@@ -403,6 +428,7 @@ class _LayerLocalAttribution(torch.autograd.Function):
         importance_store,
         layer_idx,
         sample_start,
+        importance_mode,
     ):
         ctx.layer = layer
         ctx.model = model
@@ -412,6 +438,7 @@ class _LayerLocalAttribution(torch.autograd.Function):
         ctx.importance_store = importance_store
         ctx.layer_idx = layer_idx
         ctx.sample_start = sample_start
+        ctx.importance_mode = importance_mode
         ctx.save_for_backward(hidden_states.detach())
 
         layer = layer.to(device)
@@ -475,7 +502,9 @@ class _LayerLocalAttribution(torch.autograd.Function):
             targets[1:],
             gradients[1:],
         ):
-            importance = _activation_gradient_importance(activation.detach(), gradient.detach())
+            importance = _activation_gradient_importance(
+                activation.detach(), gradient.detach(), ctx.importance_mode
+            )
             sample_end = ctx.sample_start + importance.shape[0]
             if sample_end > len(ctx.importance_store[ctx.layer_idx][group]):
                 raise RuntimeError(
@@ -488,7 +517,7 @@ class _LayerLocalAttribution(torch.autograd.Function):
 
         del layer_input, output, targets, gradients, captured
         layer.cpu()
-        return grad_input, None, None, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None, None, None
 
 
 def _build_low_entropy_seed(normalized_hidden, output_head, valid_token_mask, logits_chunk_size=128):
@@ -619,8 +648,11 @@ def _compute_layer_local_token_weights(
     alpha,
     mean_normalize,
     batch_size=1,
+    importance_mode="entropy_grad",
 ):
-    logging.info("Computing layer-local entropy-gradient token importance.")
+    if importance_mode not in {"entropy_grad", "entropy_grad_norm"}:
+        raise ValueError(f"Unsupported layer-local importance mode: {importance_mode}")
+    logging.info("Computing layer-local %s token importance.", importance_mode)
     nsamples = inps.shape[0]
     if batch_size <= 0:
         raise ValueError("entropy_grad importance batch size must be greater than 0.")
@@ -640,7 +672,7 @@ def _compute_layer_local_token_weights(
         parameter.requires_grad_(False)
     model.zero_grad(set_to_none=True)
 
-    norm = getattr(model.model, "norm", None)
+    norm = _get_final_norm(model)
     output_head = model.get_output_embeddings()
     if output_head is None:
         raise RuntimeError("entropy_grad requires a causal LM output embedding layer.")
@@ -653,7 +685,7 @@ def _compute_layer_local_token_weights(
         for sample_start in tqdm.tqdm(
             sample_starts,
             total=math.ceil(nsamples / batch_size),
-            desc="(GPTQ entropy_grad) Batches",
+            desc=f"(GPTQ {importance_mode}) Batches",
         ):
             sample_end = min(sample_start + batch_size, nsamples)
             with torch.enable_grad():
@@ -670,6 +702,7 @@ def _compute_layer_local_token_weights(
                         raw_importance,
                         layer_idx,
                         sample_start,
+                        importance_mode,
                     )
 
                 hidden_device = hidden.to(device)
@@ -987,7 +1020,7 @@ def gptq_fwrd(model, dataloader, dev, args):
         if inps.shape[0] != nsamples or not torch.equal(valid_token_mask, recaptured_mask):
             raise RuntimeError("Calibration data changed between entropy prepass and GPTQ capture.")
         del recaptured_mask
-    elif token_importance == "entropy_grad":
+    elif token_importance in {"entropy_grad", "entropy_grad_norm"}:
         layer_local_weights = _compute_layer_local_token_weights(
             model,
             layers,
@@ -998,6 +1031,7 @@ def gptq_fwrd(model, dataloader, dev, args):
             alpha=args.importance_alpha,
             mean_normalize=args.importance_mean_normalize,
             batch_size=args.importance_batch_size,
+            importance_mode=token_importance,
         )
     elif token_importance != "none":
         raise ValueError(f"Unsupported GPTQ token importance mode: {token_importance}")

@@ -1,0 +1,153 @@
+"""Command line entry point for minimal Qwen3.5 OmniQuant and LFQ."""
+
+import argparse
+import logging
+import os
+import random
+
+import numpy as np
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+
+from .calibration import omniquant
+from .datautils import get_loaders
+
+
+class LMClass:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--cache_dir", default="./cache", type=str)
+    parser.add_argument("--output_dir", default="./log", type=str)
+    parser.add_argument("--save_dir", default=None, type=str)
+    parser.add_argument("--resume", default=None, type=str)
+    parser.add_argument("--calib_dataset", default="s1k-1.1", choices=["s1k-1.1"])
+    parser.add_argument("--nsamples", default=128, type=int)
+    parser.add_argument("--seqlen", default=2048, type=int)
+    parser.add_argument("--cal_slice_mode", default="random", choices=["random", "head", "tail", "offset"])
+    parser.add_argument("--cal_slice_offset", default=0, type=int)
+    parser.add_argument("--batch_size", default=1, type=int)
+    parser.add_argument("--seed", default=2, type=int)
+    parser.add_argument("--wbits", default=4, type=int)
+    parser.add_argument("--weight_quant_format", default="int4", choices=["int4", "hif4"])
+    parser.add_argument("--abits", default=16, type=int)
+    parser.add_argument("--group_size", default=None, type=int)
+    parser.add_argument("--alpha", default=0.5, type=float)
+    parser.add_argument("--let_lr", default=5e-3, type=float)
+    parser.add_argument("--lwc_lr", default=1e-2, type=float)
+    parser.add_argument("--lfq_lr", default=2e-3, type=float)
+    parser.add_argument("--wd", default=0.0, type=float)
+    parser.add_argument("--epochs", default=10, type=int)
+    parser.add_argument("--let", action="store_true")
+    parser.add_argument("--lwc", action="store_true")
+    parser.add_argument("--aug_loss", action="store_true")
+    parser.add_argument("--symmetric", action="store_true")
+    parser.add_argument("--disable_zero_point", action="store_true")
+    parser.add_argument("--lfq", action="store_true")
+    parser.add_argument("--lfq_logits_chunk_size", default=128, type=int)
+    parser.add_argument(
+        "--token_importance", default="none",
+        choices=["none", "entropy", "entropy_grad"],
+    )
+    parser.add_argument("--entropy_alpha", default=1.0, type=float)
+    parser.add_argument(
+        "--entropy_norm", default="minmax", choices=["minmax", "zscore", "mean"]
+    )
+    parser.add_argument("--importance_alpha", default=1.0, type=float)
+    parser.add_argument("--importance_batch_size", default=1, type=int)
+    parser.add_argument(
+        "--importance_mean_normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa"])
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.epochs > 0 and not (args.lwc or args.let):
+        raise ValueError("epochs > 0 requires --lwc or --let.")
+    if args.nsamples <= 0 or args.seqlen <= 0 or args.batch_size <= 0:
+        raise ValueError("nsamples, seqlen and batch_size must be positive.")
+    if args.nsamples % args.batch_size:
+        raise ValueError("nsamples must be divisible by batch_size.")
+    if args.lfq_logits_chunk_size <= 0:
+        raise ValueError("lfq_logits_chunk_size must be positive.")
+    if args.entropy_alpha < 0 or args.importance_alpha < 0:
+        raise ValueError("entropy_alpha and importance_alpha must be non-negative.")
+    if args.importance_batch_size <= 0:
+        raise ValueError("importance_batch_size must be positive.")
+    if args.token_importance != "none" and args.seqlen < 2:
+        raise ValueError("Entropy-based token importance requires seqlen >= 2.")
+    if args.token_importance != "none" and args.lfq:
+        raise ValueError("Entropy-weighted OmniQuant cannot be combined with --lfq.")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] (%(filename)s %(lineno)d): %(levelname)s %(message)s",
+    )
+    logger = logging.getLogger("omniquant")
+    logger.info(args)
+
+    dtype = getattr(torch, args.dtype)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    config = AutoConfig.from_pretrained(args.model)
+    auto_model = AutoModelForImageTextToText if config.model_type == "qwen3_5" else AutoModelForCausalLM
+    model = auto_model.from_pretrained(
+        args.model,
+        torch_dtype=dtype,
+        device_map="cpu",
+        attn_implementation=args.attn_implementation,
+    )
+    if getattr(model.config, "model_type", None) not in {"qwen3_5", "qwen3_5_text"}:
+        raise NotImplementedError("Only Qwen3.5 dense text backbones are supported.")
+    model.eval()
+    model.requires_grad_(False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    args.weight_quant_params = {
+        "n_bits": args.wbits,
+        "symmetric": args.symmetric,
+        "dynamic_method": "per_channel",
+        "group_size": args.group_size,
+        "lwc": args.lwc,
+        "disable_zero_point": args.disable_zero_point,
+        "quant_format": args.weight_quant_format,
+    }
+    args.act_quant_params = {
+        "n_bits": args.abits,
+        "symmetric": False,
+        "dynamic_method": "per_token",
+        "group_size": None,
+        "lwc": False,
+        "disable_zero_point": False,
+    }
+    dataloader = get_loaders(
+        args.calib_dataset, args.nsamples, args.seed, args.seqlen, tokenizer,
+        args.cal_slice_mode, args.cal_slice_offset,
+    )
+    lm = LMClass(model, device)
+    omniquant(lm, args, dataloader, logger)
+    if args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
+        model.save_pretrained(args.save_dir, safe_serialization=True)
+        tokenizer.save_pretrained(args.save_dir)
+        if config.model_type == "qwen3_5":
+            AutoProcessor.from_pretrained(args.model).save_pretrained(args.save_dir)
+        logger.info("Saved loadable fake-quantized model to %s", args.save_dir)
+
+
+if __name__ == "__main__":
+    main()

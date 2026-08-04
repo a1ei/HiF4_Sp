@@ -121,12 +121,12 @@ echo "[install.sh] ==> 源码编译安装 vLLM v0.19.1 (editable, no build isola
 # lighteval 本体。版本约束放宽依赖 3rdparty/lighteval 里的本地补丁。
 echo "[install.sh] ==> 安装 lighteval (editable, 不带 [vllm] extras)"
 pushd "$REPO_ROOT/3rdparty/lighteval" >/dev/null
-pip install --editable .
+pip install --editable . --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
 popd >/dev/null
 
 # -------- 6. HiFloat4 CUDA 扩展 --------
 echo "[install.sh] ==> 编译 HiFloat4 CUDA 扩展"
-export CUDA_HOME=/home/liuzhilei/anaconda3/envs/hif4/targets/x86_64-linux
+export CUDA_HOME=/root/miniconda3/envs/hif4/targets/x86_64-linux
 
 export CPATH="$CUDA_HOME/include:${CPATH:-}"
 export C_INCLUDE_PATH="$CUDA_HOME/include:${C_INCLUDE_PATH:-}"

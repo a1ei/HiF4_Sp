@@ -1,6 +1,6 @@
-# Entropy-weighted GPTQ
+# Entropy-weighted GPTQ and AWQ
 
-这个选项在原 GPTQ Hessian 统计上增加位置级 next-token entropy 权重，不引入训练、反向传播或模型结构修改。默认关闭，关闭时走原始 GPTQ Hessian 路径。
+GPTQ 在 Hessian 统计中使用位置级 next-token entropy 权重；AWQ 在候选 scale 的逐 token 重构误差中使用相同权重。默认关闭，`none` 保持各算法原始路径。
 
 ## 参数
 
@@ -49,6 +49,20 @@ H += X_weighted @ X_weighted.T
 ```
 
 所有 entropy 和 lambda 都按整个校准集的有效 token 统计和归一化。启用后日志会输出 entropy、lambda 的 mean/std/min/max，并逐层显示是否启用 weighted Hessian。
+
+## Gradient-only variant
+
+GPTQ additionally supports `TOKEN_IMPORTANCE=entropy_grad_norm`. It uses the same low-entropy seed, top-1 margin anchor, backward pass, module groups and dataset-level normalization as `entropy_grad`, but defines local importance as `norm(gradient, dim=-1)` instead of `norm(activation * gradient, dim=-1)`. This mode is intentionally restricted to GPTQ.
+
+## AWQ weighting
+
+AWQ accepts the same `TOKEN_IMPORTANCE=none|entropy|entropy_grad` environment variable through `quantize_qwen3_5_27b.sh`. Global `entropy` weights each candidate scale by its per-token reconstruction error. `entropy_grad` selects qkv, o, up/gate or down weights according to the module being searched.
+
+```bash
+AWQ=true GPTQ=false MAGR=false SMOOTHQUANT=false \
+TOKEN_IMPORTANCE=entropy ENTROPY_ALPHA=1.0 ENTROPY_NORM=minmax \
+bash HiFloat4/quantize_qwen3_5_27b.sh
+```
 
 ## Module-group-specific entropy-gradient importance
 

@@ -34,8 +34,6 @@ def download_nltk_resources():
         nltk.download("punkt_tab")
 
 
-download_nltk_resources()
-
 WORD_LIST = [
     "western",
     "sentence",
@@ -1675,6 +1673,7 @@ def count_words(text):
 
 @functools.lru_cache(maxsize=None)
 def _get_sentence_tokenizer():
+    download_nltk_resources()
     return nltk.data.load("nltk:tokenizers/punkt/english.pickle")
 
 

@@ -383,8 +383,8 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--token_importance",
         type=str,
         default="none",
-        choices=["none", "entropy", "entropy_grad"],
-        help="Optional GPTQ token-level Hessian weighting method.",
+        choices=["none", "entropy", "entropy_grad", "entropy_grad_norm"],
+        help="Optional GPTQ/AWQ token-level entropy weighting method.",
     )
     parser.add_argument("--entropy_alpha", type=float, default=1.0)
     parser.add_argument(
@@ -462,8 +462,14 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise ValueError("--importance_alpha must be greater than or equal to 0.")
     if args.importance_batch_size <= 0:
         raise ValueError("--importance_batch_size must be greater than 0.")
-    if args.token_importance != "none" and (not args.gptq or args.gptq_load_path):
-        raise ValueError("--token_importance is only supported when running new GPTQ quantization.")
+    if args.token_importance == "entropy_grad_norm" and not args.gptq:
+        raise ValueError("--token_importance=entropy_grad_norm is only supported by GPTQ.")
+    if args.token_importance != "none" and not (
+        (args.gptq and not args.gptq_load_path) or args.awq
+    ):
+        raise ValueError(
+            "--token_importance is only supported when running new GPTQ or AWQ quantization."
+        )
     needs_calibration = (args.gptq and not args.gptq_load_path) or any(
         (args.smoothquant, args.awq, args.magr, args.flatquant)
     )
@@ -472,7 +478,7 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
             raise ValueError("--cal_nsamples must be greater than 0.")
         if args.cal_seqlen <= 0:
             raise ValueError("--cal_seqlen must be greater than 0.")
-        if args.token_importance in {"entropy", "entropy_grad"} and args.cal_seqlen < 2:
+        if args.token_importance in {"entropy", "entropy_grad", "entropy_grad_norm"} and args.cal_seqlen < 2:
             raise ValueError("Entropy-based token importance requires --cal_seqlen to be at least 2.")
         if args.cal_slice_offset < 0:
             raise ValueError("--cal_slice_offset must be greater than or equal to 0.")

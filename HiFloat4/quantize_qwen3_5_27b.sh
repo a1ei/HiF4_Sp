@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export HF_ENDPOINT="https://hf-mirror.com"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "hif4" ]]; then
   echo "错误：当前环境不是 hif4。请先执行: conda activate hif4" >&2

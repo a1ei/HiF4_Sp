@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Train an lm_head LoRA on </think> and logical-connective positions."""
+
+import argparse
+import json
+import math
+import os
+import random
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from datasets import load_dataset
+from safetensors.torch import save_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+DEFAULT_CONNECTIVES = (
+    "therefore,thus,however,hence,moreover,consequently,"
+    "first,second,finally,otherwise,alternatively,nevertheless"
+)
+START_THINK_TEXT = "<think>"
+END_THINK_TEXT = "</think>"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Distill an end-think plus logical-connective lm_head LoRA."
+    )
+    parser.add_argument("--student_model", required=True)
+    parser.add_argument("--teacher_model", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--cache_dir", default=None)
+    parser.add_argument("--dataset", default="simplescaling/s1K-1.1")
+    parser.add_argument("--nsamples", type=int, default=128)
+    parser.add_argument("--max_length", type=int, default=16384)
+    parser.add_argument("--max_positive_positions", type=int, default=8)
+    parser.add_argument("--num_negative_positions", type=int, default=8)
+    parser.add_argument("--connectives", default=DEFAULT_CONNECTIVES)
+    parser.add_argument("--max_target_tokens", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--teacher_device", default="cuda:0")
+    parser.add_argument("--student_device", default="cuda:0")
+    parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
+    parser.add_argument("--attn_implementation", default="sdpa")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--train_samples", type=int, default=None)
+    parser.add_argument(
+        "--phase",
+        choices=["all", "prepare", "teacher", "student", "train"],
+        default="all",
+    )
+    return parser.parse_args()
+
+
+def _single_token_id(tokenizer, text):
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(f"{text!r} must encode to one token, got {ids}.")
+    return ids[0]
+
+
+def _evenly_spaced(items, count):
+    if len(items) < count:
+        raise ValueError(f"Only {len(items)} eligible positions; {count} are required.")
+    if count == 1:
+        return [items[len(items) // 2]]
+    return [items[(i * (len(items) - 1)) // (count - 1)] for i in range(count)]
+
+
+def build_connective_sequences(tokenizer, connective_csv):
+    words = [word.strip() for word in connective_csv.split(",") if word.strip()]
+    if not words:
+        raise ValueError("--connectives must contain at least one word.")
+    sequences = set()
+    for word in words:
+        for form in {word.lower(), word.capitalize()}:
+            for prefix in ("", " "):
+                ids = tuple(tokenizer.encode(prefix + form, add_special_tokens=False))
+                if ids:
+                    sequences.add(ids)
+    return sorted(sequences, key=lambda ids: (-len(ids), ids)), words
+
+
+def find_connective_positions(input_ids, start, end, sequences):
+    matches = []
+    occupied = set()
+    for index in range(start + 1, end):
+        for sequence in sequences:
+            stop = index + len(sequence)
+            if stop <= end and tuple(input_ids[index:stop]) == sequence:
+                if not any(position in occupied for position in range(index, stop)):
+                    matches.append((index - 1, sequence[0], index, stop))
+                    occupied.update(range(index, stop))
+                break
+    return matches
+
+
+def build_examples(args, tokenizer, cache_path):
+    start_id = _single_token_id(tokenizer, START_THINK_TEXT)
+    end_id = _single_token_id(tokenizer, END_THINK_TEXT)
+    sequences, words = build_connective_sequences(tokenizer, args.connectives)
+    dataset = load_dataset(args.dataset, split="train")
+    indices = list(range(len(dataset)))
+    random.Random(args.seed).shuffle(indices)
+    examples = []
+    observed_target_ids = set()
+
+    for source_index in indices:
+        row = dataset[source_index]
+        question = row.get("question")
+        thinking = row.get("deepseek_thinking_trajectory")
+        attempt = row.get("deepseek_attempt")
+        if not all(isinstance(x, str) and x.strip() for x in (question, thinking, attempt)):
+            raise ValueError(f"Dataset sample {source_index} has invalid required fields.")
+        messages = [
+            {"role": "user", "content": question.strip()},
+            {"role": "assistant", "content": (
+                f"{START_THINK_TEXT}\n{thinking.strip()}\n"
+                f"{END_THINK_TEXT}\n\n{attempt.strip()}"
+            )},
+        ]
+        rendered = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, enable_thinking=True
+        )
+        input_ids = tokenizer(rendered, add_special_tokens=False).input_ids
+        if len(input_ids) > args.max_length:
+            continue
+        starts = [i for i, token_id in enumerate(input_ids) if token_id == start_id]
+        ends = [i for i, token_id in enumerate(input_ids) if token_id == end_id]
+        if len(starts) != 1 or len(ends) != 1 or ends[0] <= starts[0] + 2:
+            raise ValueError(f"Dataset sample {source_index} has an invalid think span.")
+        start, end = starts[0], ends[0]
+        matches = find_connective_positions(input_ids, start, end, sequences)
+        if not matches:
+            continue
+        if len(matches) > args.max_positive_positions:
+            matches = _evenly_spaced(matches, args.max_positive_positions)
+        matches.append((end - 1, end_id, end, end + 1))
+        connective_token_positions = {
+            position for _, _, begin, stop in matches for position in range(begin, stop)
+        }
+        eligible_negatives = [
+            position for position in range(start + 1, end - 1)
+            if position + 1 not in connective_token_positions
+        ]
+        negatives = _evenly_spaced(eligible_negatives, args.num_negative_positions)
+        positions = []
+        target_ids = []
+        positive_mask = []
+        for positive_position, target_id, _, _ in matches:
+            positions.append(positive_position)
+            target_ids.append(target_id)
+            positive_mask.append(True)
+            for negative_position in negatives:
+                positions.append(negative_position)
+                target_ids.append(target_id)
+                positive_mask.append(False)
+            observed_target_ids.add(target_id)
+        examples.append({
+            "source_index": source_index,
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "positions": torch.tensor(positions, dtype=torch.long),
+            "target_ids": torch.tensor(target_ids, dtype=torch.long),
+            "positive_mask": torch.tensor(positive_mask, dtype=torch.bool),
+        })
+        if len(examples) == args.nsamples:
+            break
+
+    if len(examples) != args.nsamples:
+        raise ValueError(
+            f"Only {len(examples)} usable samples fit max_length={args.max_length}; "
+            f"{args.nsamples} are required."
+        )
+    target_token_ids = sorted(observed_target_ids)
+    if not 2 <= len(target_token_ids) <= args.max_target_tokens:
+        raise ValueError(
+            f"Observed {len(target_token_ids)} connective first-token IDs; expected 2.."
+            f"{args.max_target_tokens}. Narrow --connectives or raise --max_target_tokens."
+        )
+    payload = {
+        "examples": examples,
+        "target_token_ids": target_token_ids,
+        "connectives": words,
+        "num_negative_positions": args.num_negative_positions,
+        "max_positive_positions": args.max_positive_positions,
+        "max_length": args.max_length,
+        "dataset": args.dataset,
+        "seed": args.seed,
+    }
+    torch.save(payload, cache_path)
+    print(
+        f"Prepared {len(examples)} samples with {len(target_token_ids)} target token IDs "
+        f"at {cache_path}: {target_token_ids}"
+    )
+    return payload
+
+
+def _dtype_from_name(name):
+    return {"float16": torch.float16, "bfloat16": torch.bfloat16}[name]
+
+
+def _partition_logits(logits, target_token_ids):
+    logits = logits.float()
+    token_ids = torch.tensor(target_token_ids, device=logits.device)
+    target_logits = logits.index_select(-1, token_ids)
+    other_logits = logits.clone()
+    other_logits.index_fill_(-1, token_ids, -torch.inf)
+    other_logsumexp = torch.logsumexp(other_logits, dim=-1, keepdim=True)
+    return target_logits, other_logsumexp
+
+
+def extract_features(args, model_path, device, examples, output_path, student):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=_dtype_from_name(args.dtype),
+        device_map={"": device},
+        attn_implementation=args.attn_implementation,
+        trust_remote_code=False,
+    )
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    target_logits, other_logsumexp, hidden_states = [], [], []
+    source_indices, sample_indices, target_ids, positive_masks = [], [], [], []
+    with torch.inference_mode():
+        for sample_index, example in enumerate(examples["examples"]):
+            ids = example["input_ids"].unsqueeze(0).to(device)
+            positions = example["positions"].to(device)
+            output = model.model(input_ids=ids, use_cache=False, return_dict=True)
+            selected = output.last_hidden_state[0].index_select(0, positions)
+            sample_target_logits, sample_other_logsumexp = [], []
+            for begin in range(0, selected.shape[0], 16):
+                chunk_hidden = selected[begin:begin + 16]
+                logits = model.lm_head(chunk_hidden)
+                selected_logits, remaining_logits = _partition_logits(
+                    logits, examples["target_token_ids"]
+                )
+                sample_target_logits.append(selected_logits.cpu())
+                sample_other_logsumexp.append(remaining_logits.cpu())
+            target_logits.append(torch.cat(sample_target_logits))
+            other_logsumexp.append(torch.cat(sample_other_logsumexp))
+            if student:
+                hidden_states.append(selected.float().cpu())
+            event_count = positions.numel()
+            source_indices.extend([example["source_index"]] * event_count)
+            sample_indices.extend([sample_index] * event_count)
+            target_ids.append(example["target_ids"])
+            positive_masks.append(example["positive_mask"])
+            print(f"{'Student' if student else 'Teacher'}: {sample_index + 1}/{len(examples['examples'])}")
+    payload = {
+        "target_logits": torch.cat(target_logits),
+        "other_logsumexp": torch.cat(other_logsumexp),
+        "source_indices": source_indices,
+        "sample_indices": torch.tensor(sample_indices, dtype=torch.long),
+        "target_ids": torch.cat(target_ids),
+        "positive_mask": torch.cat(positive_masks),
+        "target_token_ids": examples["target_token_ids"],
+    }
+    if student:
+        payload.update({
+            "hidden_states": torch.cat(hidden_states),
+            "hidden_size": model.config.hidden_size,
+            "vocab_size": model.config.vocab_size,
+        })
+    torch.save(payload, output_path)
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _balanced_mean(token_losses, positive_mask):
+    return 0.5 * (
+        token_losses[positive_mask].mean() + token_losses[~positive_mask].mean()
+    )
+
+
+def _soft_cross_entropy(student_logits, teacher_logits):
+    teacher_prob = torch.softmax(teacher_logits.float(), dim=-1).detach()
+    student_log_prob = torch.log_softmax(student_logits.float(), dim=-1)
+    return -(teacher_prob * student_log_prob).sum(dim=-1)
+
+
+def train_adapter(args, examples_path, teacher_path, student_path):
+    examples = torch.load(examples_path, map_location="cpu", weights_only=False)
+    teacher = torch.load(teacher_path, map_location="cpu", weights_only=False)
+    student = torch.load(student_path, map_location="cpu", weights_only=False)
+    for key in ("source_indices", "sample_indices", "target_ids", "positive_mask", "target_token_ids"):
+        left, right = teacher[key], student[key]
+        if isinstance(left, torch.Tensor):
+            equal = torch.equal(left, right)
+        else:
+            equal = left == right
+        if not equal:
+            raise ValueError(f"Teacher/student cache mismatch: {key}.")
+    nsamples = len(examples["examples"])
+    train_samples = args.train_samples or (nsamples - max(1, nsamples // 8))
+    if not 1 <= train_samples < nsamples:
+        raise ValueError("--train_samples must leave at least one validation sample.")
+    permutation = torch.randperm(nsamples, generator=torch.Generator().manual_seed(args.seed))
+    train_sample_ids = permutation[:train_samples]
+    validation_sample_ids = permutation[train_samples:]
+    sample_indices = student["sample_indices"]
+    train_mask = torch.isin(sample_indices, train_sample_ids)
+    validation_mask = torch.isin(sample_indices, validation_sample_ids)
+    device = torch.device(args.student_device)
+    hidden = student["hidden_states"].to(device)
+    student_target_logits = student["target_logits"].to(device)
+    student_other_logsumexp = student["other_logsumexp"].to(device)
+    teacher_partition_logits = torch.cat(
+        [teacher["target_logits"], teacher["other_logsumexp"]], dim=-1
+    ).to(device)
+    positive_mask = student["positive_mask"].to(device)
+    token_to_rank = {token_id: index for index, token_id in enumerate(examples["target_token_ids"])}
+    rank_indices = torch.tensor(
+        [token_to_rank[int(token_id)] for token_id in student["target_ids"]],
+        device=device,
+    )
+    rank = len(token_to_rank)
+    lora_a = torch.nn.Parameter(torch.zeros(rank, student["hidden_size"], device=device))
+    optimizer = torch.optim.AdamW([lora_a], lr=args.learning_rate, weight_decay=0.0)
+
+    def loss_for(mask):
+        corrections = hidden[mask] @ lora_a.transpose(0, 1)
+        corrected_partition = torch.cat(
+            [
+                student_target_logits[mask] + corrections,
+                student_other_logsumexp[mask],
+            ],
+            dim=-1,
+        )
+        soft_loss = _soft_cross_entropy(corrected_partition, teacher_partition_logits[mask])
+        hard_labels = torch.where(
+            positive_mask[mask], rank_indices[mask], torch.full_like(rank_indices[mask], rank)
+        )
+        hard_loss = F.cross_entropy(corrected_partition.float(), hard_labels, reduction="none")
+        total = _balanced_mean(soft_loss, positive_mask[mask])
+        total = total + _balanced_mean(hard_loss, positive_mask[mask])
+        return total, corrected_partition
+
+    best_loss, best_a = math.inf, None
+    for epoch in range(args.epochs):
+        optimizer.zero_grad(set_to_none=True)
+        train_loss, _ = loss_for(train_mask)
+        train_loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            validation_loss, _ = loss_for(validation_mask)
+        print(
+            f"Epoch {epoch + 1}/{args.epochs}: train_loss={train_loss.item():.6f}, "
+            f"validation_loss={validation_loss.item():.6f}"
+        )
+        if validation_loss.item() < best_loss:
+            best_loss = validation_loss.item()
+            best_a = lora_a.detach().cpu().clone()
+    if best_a is None:
+        raise RuntimeError("Training did not produce a checkpoint.")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lora_b = torch.zeros(student["vocab_size"], rank, dtype=torch.bfloat16)
+    for token_id, rank_index in token_to_rank.items():
+        lora_b[token_id, rank_index] = 1
+    save_file({
+        "base_model.model.lm_head.lora_A.weight": best_a.to(torch.bfloat16).contiguous(),
+        "base_model.model.lm_head.lora_B.weight": lora_b.contiguous(),
+    }, output_dir / "adapter_model.safetensors")
+    adapter_config = {
+        "peft_type": "LORA",
+        "base_model_name_or_path": os.path.abspath(args.student_model),
+        "task_type": "CAUSAL_LM",
+        "inference_mode": True,
+        "r": rank,
+        "lora_alpha": rank,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "target_modules": ["lm_head"],
+    }
+    source_indices = [example["source_index"] for example in examples["examples"]]
+    metrics = {
+        "best_validation_loss": best_loss,
+        "rank": rank,
+        "target_token_ids": examples["target_token_ids"],
+        "connectives": examples["connectives"],
+        "train_source_indices": [source_indices[i] for i in train_sample_ids.tolist()],
+        "validation_source_indices": [source_indices[i] for i in validation_sample_ids.tolist()],
+    }
+    for name, payload in (
+        ("adapter_config.json", adapter_config),
+        ("training_metrics.json", metrics),
+    ):
+        with open(output_dir / name, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+    print(json.dumps(metrics, indent=2, ensure_ascii=False))
+    print(f"Saved adapter to {output_dir}.")
+
+
+def main():
+    args = parse_args()
+    if args.nsamples < 2:
+        raise ValueError("--nsamples must be at least 2.")
+    if args.num_negative_positions < 1 or args.max_positive_positions < 1:
+        raise ValueError("Position counts must be positive.")
+    if args.max_length < 1 or args.epochs < 1 or args.learning_rate <= 0:
+        raise ValueError("Length, epochs, and learning rate must be positive.")
+    cache_dir = Path(args.cache_dir or (Path(args.output_dir) / "feature_cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    examples_path = cache_dir / "examples.pt"
+    teacher_path = cache_dir / "teacher_features.pt"
+    student_path = cache_dir / "student_features.pt"
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.student_model, use_fast=False, trust_remote_code=False
+    )
+    if args.phase in {"all", "prepare"}:
+        examples = build_examples(args, tokenizer, examples_path)
+    else:
+        examples = torch.load(examples_path, map_location="cpu", weights_only=False)
+    if args.phase in {"all", "teacher"}:
+        extract_features(args, args.teacher_model, args.teacher_device, examples, teacher_path, False)
+    if args.phase in {"all", "student"}:
+        extract_features(args, args.student_model, args.student_device, examples, student_path, True)
+    if args.phase in {"all", "train"}:
+        train_adapter(args, examples_path, teacher_path, student_path)
+
+
+if __name__ == "__main__":
+    main()

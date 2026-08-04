@@ -352,6 +352,12 @@ def parse_args():
         help="强制使用 tokenizer 的 chat template 构造评测 prompt。",
     )
     parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="vLLM local LoRA adapter directory.",
+    )
+    parser.add_argument(
         "--kv_quant_format",
         choices=["none", "nvfp4", "hif4", "hif4-1"],
         default="none",
@@ -386,6 +392,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.lora_path:
+        args.lora_path = os.path.abspath(args.lora_path)
+        required_adapter_files = ("adapter_config.json", "adapter_model.safetensors")
+        missing_adapter_files = [
+            name
+            for name in required_adapter_files
+            if not os.path.isfile(os.path.join(args.lora_path, name))
+        ]
+        if missing_adapter_files:
+            raise FileNotFoundError(f"LoRA adapter missing files: {missing_adapter_files}")
     if args.seed < 0:
         raise ValueError("--seed 须为非负整数")
     if (
@@ -495,6 +511,8 @@ def main():
     )
     if args.use_chat_template:
         vllm_model_kwargs["override_chat_template"] = True
+    if args.lora_path:
+        vllm_model_kwargs["lora_path"] = args.lora_path
     additional_config = {}
     if args.fp32_weights_bf16_activations:
         additional_config["fp32_weights_bf16_activations"] = True

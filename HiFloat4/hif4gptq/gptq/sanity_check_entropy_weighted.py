@@ -16,6 +16,7 @@ sys.path.insert(0, str(HIF4GPTQ_ROOT))
 from gptq.gptq_utils import (
     GPTQ,
     _LOCAL_IMPORTANCE_GROUPS,
+    _activation_gradient_importance,
     _compute_fp_token_entropy,
     _compute_layer_local_token_weights,
     _local_importance_group_for_linear,
@@ -223,6 +224,31 @@ class EntropyWeightedGPTQSanityCheck(unittest.TestCase):
             original_requires_grad,
         )
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+
+    def test_entropy_grad_norm_uses_gradient_only(self):
+        activation = torch.tensor([[[2.0, 3.0], [4.0, 5.0]]])
+        gradient = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+        actual = _activation_gradient_importance(
+            activation, gradient, mode="entropy_grad_norm"
+        )
+        expected = torch.linalg.vector_norm(gradient, dim=-1)
+        self.assertTrue(torch.equal(actual, expected))
+
+        model = TinyCausalLM(attribution_layers=True)
+        inps = torch.randn(2, 5, 4)
+        valid_mask = torch.ones((2, 5), dtype=torch.bool)
+        weights = _compute_layer_local_token_weights(
+            model, model.model.layers, inps, layer_kwargs={},
+            valid_token_mask=valid_mask, device=torch.device("cpu"),
+            alpha=1.0, mean_normalize=True, batch_size=2,
+            importance_mode="entropy_grad_norm",
+        )
+        self.assertEqual(len(weights), 2)
+        for layer_weights in weights:
+            for weight in layer_weights.values():
+                self.assertEqual(tuple(weight.shape), (2, 5))
+                self.assertTrue(torch.isfinite(weight).all())
+                self.assertAlmostEqual(weight.mean().item(), 1.0, places=6)
 
     def test_layer_local_linear_group_mapping(self):
         expected = {
