@@ -23,6 +23,7 @@ CAL_SEQLEN="${CAL_SEQLEN:-512}"
 CAL_SLICE_MODE="${CAL_SLICE_MODE:-head}"
 CAL_SLICE_OFFSET="${CAL_SLICE_OFFSET:-0}"
 GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
+GPTQ_ATTN_IMPLEMENTATION="${GPTQ_ATTN_IMPLEMENTATION:-same}"
 BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}" #magr中 -1是per_layer
 TOKEN_IMPORTANCE="${TOKEN_IMPORTANCE:-none}"
 ENTROPY_ALPHA="${ENTROPY_ALPHA:-1.0}"
@@ -33,6 +34,23 @@ IMPORTANCE_BATCH_SIZE="${IMPORTANCE_BATCH_SIZE:-1}"
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
 HIF4A="${HIF4A:-false}"
 ACT_QUANT_FORMAT="${ACT_QUANT_FORMAT:-hif4}"
+HIF4LGQ="${HIF4LGQ:-false}"
+LGQ_CALIB_SEQ_LEN="${LGQ_CALIB_SEQ_LEN:-0}"
+LGQ_SUBSPACE_MODE="${LGQ_SUBSPACE_MODE:-low}"
+LGQ_SUBSPACE_RANK="${LGQ_SUBSPACE_RANK:-64}"
+LGQ_LOW_MID_START_QUANTILE="${LGQ_LOW_MID_START_QUANTILE:-0.1}"
+LGQ_STEPS="${LGQ_STEPS:-5000}"
+LGQ_LOG_INTERVAL="${LGQ_LOG_INTERVAL:-500}"
+LGQ_LR="${LGQ_LR:-0.0001}"
+LGQ_LAMBDA_LOGIC="${LGQ_LAMBDA_LOGIC:-1.0}"
+LGQ_LAMBDA_REG="${LGQ_LAMBDA_REG:-0.0001}"
+LGQ_GROUP_SIZE="${LGQ_GROUP_SIZE:-0}"
+LGQ_GROUP_LOSS="${LGQ_GROUP_LOSS:-max}"
+LGQ_GROUP_SMOOTH_TAU="${LGQ_GROUP_SMOOTH_TAU:-0.001}"
+LGQ_LOGIC_KEYWORDS_PATH="${LGQ_LOGIC_KEYWORDS_PATH:-none}"
+LGQ_TARGET_PATTERNS="${LGQ_TARGET_PATTERNS:-*}"
+LGQ_ARTIFACT_DIR="${LGQ_ARTIFACT_DIR:-none}"
+LGQ_SAVE_MODE="${LGQ_SAVE_MODE:-none}"
 SMOOTHQUANT_ALPHA="${SMOOTHQUANT_ALPHA:-0.5}"
 SMOOTHQUANT_SCALE_ONLY="${SMOOTHQUANT_SCALE_ONLY:-false}"
 SAVE_NVFP4_ACTIVATION_SCALES="${SAVE_NVFP4_ACTIVATION_SCALES:-true}"
@@ -68,7 +86,25 @@ python HiFloat4/main.py \
   --hif4_weight_format "${HIF4_WEIGHT_FORMAT}" \
   --hif4a "${HIF4A}" \
   --act_quant_format "${ACT_QUANT_FORMAT}" \
+  --hif4lgq "${HIF4LGQ}" \
+  --lgq_calib_seq_len "${LGQ_CALIB_SEQ_LEN}" \
+  --lgq_subspace_mode "${LGQ_SUBSPACE_MODE}" \
+  --lgq_subspace_rank "${LGQ_SUBSPACE_RANK}" \
+  --lgq_low_mid_start_quantile "${LGQ_LOW_MID_START_QUANTILE}" \
+  --lgq_steps "${LGQ_STEPS}" \
+  --lgq_log_interval "${LGQ_LOG_INTERVAL}" \
+  --lgq_lr "${LGQ_LR}" \
+  --lgq_lambda_logic "${LGQ_LAMBDA_LOGIC}" \
+  --lgq_lambda_reg "${LGQ_LAMBDA_REG}" \
+  --lgq_group_size "${LGQ_GROUP_SIZE}" \
+  --lgq_group_loss "${LGQ_GROUP_LOSS}" \
+  --lgq_group_smooth_tau "${LGQ_GROUP_SMOOTH_TAU}" \
+  --lgq_logic_keywords_path "${LGQ_LOGIC_KEYWORDS_PATH}" \
+  --lgq_target_patterns "${LGQ_TARGET_PATTERNS}" \
+  --lgq_artifact_dir "${LGQ_ARTIFACT_DIR}" \
+  --lgq_save_mode "${LGQ_SAVE_MODE}" \
   --gptq "${GPTQ}" \
+  --gptq_attn_implementation "${GPTQ_ATTN_IMPLEMENTATION}" \
   --smoothquant "${SMOOTHQUANT}" \
   --awq "${AWQ}" \
   --magr "${MAGR}" \

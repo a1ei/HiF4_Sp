@@ -212,9 +212,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         self.fp32_weights_bf16_activations = bool(
             additional_config.get("fp32_weights_bf16_activations", False)
         )
-        if self.fp32_weights_bf16_activations and self.fake_act_quant != "none":
+        if (
+            self.fp32_weights_bf16_activations
+            and self.fake_act_quant not in ("none", "nvfp4")
+        ):
             raise ValueError(
-                "fp32_weights_bf16_activations cannot be combined with fake_act_quant"
+                "fp32_weights_bf16_activations only supports "
+                "fake_act_quant=none or nvfp4"
             )
         self.nvf4_activation_scales_path = additional_config.get(
             "nvf4_activation_scales_path"
@@ -404,6 +408,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 raise TypeError(
                     "FP32-weight/BF16-activation mode requires BF16 Linear inputs, "
                     f"got {x.dtype} for {getattr(layer, 'prefix', '')}"
+                )
+            if self.nvf4_fake_act and not self._skip_nvf4_fake_act(layer):
+                input_global_scale = layer._nvf4_input_global_scale
+                if input_global_scale.device != x.device:
+                    raise ValueError(
+                        "NVFP4 activation scale must be on the same device as "
+                        f"the input. Got scale on {input_global_scale.device} "
+                        f"and input on {x.device}."
+                    )
+                x = fake_quant_nvfp4_activation(
+                    x,
+                    input_global_scale,
+                    output_dtype=torch.bfloat16,
                 )
             bias_fp32 = bias.to(torch.float32) if bias is not None else None
             output = dispatch_unquantized_gemm()(

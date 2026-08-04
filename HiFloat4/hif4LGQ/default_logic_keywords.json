@@ -1,0 +1,47 @@
+{
+  "conclusion_and_causality": [
+    "therefore",
+    "thus",
+    "hence",
+    "because",
+    "so",
+    "consequently",
+    "as a result"
+  ],
+  "contrast_and_alternatives": [
+    "however",
+    "but",
+    "although",
+    "though",
+    "alternatively",
+    "nevertheless",
+    "nonetheless",
+    "instead",
+    "otherwise",
+    "whereas",
+    "yet"
+  ],
+  "progression_and_structure": [
+    "furthermore",
+    "moreover",
+    "additionally",
+    "then",
+    "next",
+    "finally",
+    "answer",
+    "solution",
+    "conclusion",
+    "final answer"
+  ],
+  "reflection_and_correction": [
+    "wait",
+    "actually",
+    "correction",
+    "reconsider",
+    "recheck",
+    "check",
+    "verify",
+    "mistake",
+    "wrong"
+  ]
+}

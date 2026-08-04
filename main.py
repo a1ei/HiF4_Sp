@@ -396,9 +396,9 @@ def main():
     if (
         args.fp32_weights_bf16_activations
         or args.fp32_weights_fp32_activations
-    ) and args.fake_act_quant != "none":
+    ) and args.fake_act_quant not in ("none", "nvfp4"):
         raise ValueError(
-            "FP32 权重基线不能同时设置 --fake_act_quant。"
+            "FP32 权重模式只支持 --fake_act_quant none 或 nvfp4。"
         )
     if args.kv_quant_format == "nvfp4" and args.kv_quant_chunk_size < 1:
         raise ValueError("--kv_quant_chunk_size 须为正整数")

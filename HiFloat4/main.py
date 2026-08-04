@@ -353,8 +353,71 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument("--exclude-layers", nargs="*", default=["lm_head"], help="Exact layer names to skip")
     parser.add_argument("--disable-fast-forward", action="store_true", help="Disable QLinear2 fast-forward path")
 
+    parser.add_argument(
+        "--hif4lgq",
+        type=str2bool,
+        default=False,
+        help="Enable Hessian spectral Logic Guard Quant weight optimization.",
+    )
+    parser.add_argument(
+        "--lgq_calib_seq_len",
+        type=int,
+        default=0,
+        help="LGQ per-sample sequence limit; 0 keeps each complete sequence.",
+    )
+    parser.add_argument(
+        "--lgq_subspace_mode",
+        type=str,
+        default="low",
+        choices=["low", "low_mid"],
+    )
+    parser.add_argument("--lgq_subspace_rank", type=int, default=64)
+    parser.add_argument("--lgq_low_mid_start_quantile", type=float, default=0.1)
+    parser.add_argument("--lgq_steps", type=int, default=100)
+    parser.add_argument(
+        "--lgq_log_interval",
+        type=int,
+        default=500,
+        help="Log per-Linear LGQ loss progress every N Adam steps; 0 disables it.",
+    )
+    parser.add_argument("--lgq_lr", type=float, default=1e-3)
+    parser.add_argument("--lgq_lambda_logic", type=float, default=1.0)
+    parser.add_argument("--lgq_lambda_reg", type=float, default=1e-4)
+    parser.add_argument(
+        "--lgq_group_size",
+        type=int,
+        default=0,
+        help="LGQ weight group size; 0 selects it from hif4_weight_format.",
+    )
+    parser.add_argument(
+        "--lgq_group_loss",
+        type=str,
+        default="max",
+        choices=["max", "logsumexp"],
+    )
+    parser.add_argument("--lgq_group_smooth_tau", type=float, default=1e-3)
+    parser.add_argument("--lgq_logic_keywords_path", type=str2path, default=None)
+    parser.add_argument("--lgq_target_patterns", nargs="+", default=["*"])
+    parser.add_argument("--lgq_artifact_dir", type=str2path, default=None)
+    parser.add_argument(
+        "--lgq_save_mode",
+        type=str,
+        default="none",
+        choices=["none", "delta", "weights", "both"],
+    )
+
     parser.add_argument("--gptq", type=str2bool, default=False)
     parser.add_argument("--gptq_percdamp", type=float, default=0.01)
+    parser.add_argument(
+        "--gptq_attn_implementation",
+        type=str,
+        default="same",
+        choices=["same", "eager", "sdpa", "flash_attention_2"],
+        help=(
+            "Attention backend used only while running new GPTQ calibration. "
+            "'same' keeps --attn-implementation."
+        ),
+    )
     parser.add_argument(
         "--cal_dataset",
         type=str,
@@ -447,8 +510,16 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
     set_seed(args.seed)
     args.hif4_weight_qtype = _hif4_weight_qtype(args.hif4_weight_format)
     args.act_quant_qtype = _quant_format_qtype(args.act_quant_format)
-    if args.save_only and not args.gptq_save_path:
-        raise ValueError("--save_only requires --gptq_save_path.")
+    hif4lgq_enabled = bool(getattr(args, "hif4lgq", False))
+    lgq_saves_weights = (
+        hif4lgq_enabled
+        and args.lgq_save_mode in {"weights", "both"}
+        and args.lgq_artifact_dir
+    )
+    if args.save_only and not args.gptq_save_path and not lgq_saves_weights:
+        raise ValueError(
+            "--save_only requires --gptq_save_path or LGQ weight artifact saving."
+        )
     if args.smoothquant_scale_only and not args.smoothquant:
         raise ValueError("--smoothquant_scale_only requires --smoothquant true.")
     if args.hif4_weight_qtype == "hifx4_1" and (args.gptq or args.magr) and args.block_size_linear != 64:
@@ -464,6 +535,40 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise ValueError("--importance_batch_size must be greater than 0.")
     if args.token_importance != "none" and (not args.gptq or args.gptq_load_path):
         raise ValueError("--token_importance is only supported when running new GPTQ quantization.")
+    if hif4lgq_enabled:
+        if args.cal_dataset != "s1k-1.1":
+            raise ValueError("--hif4lgq currently requires --cal_dataset s1k-1.1.")
+        if args.gptq_load_path:
+            raise ValueError(
+                "--hif4lgq cannot be combined with --gptq_load_path because "
+                "loading that checkpoint would overwrite the optimized weights."
+            )
+        if args.cal_nsamples <= 0:
+            raise ValueError("--cal_nsamples must be greater than 0 for hif4LGQ.")
+        if args.lgq_calib_seq_len < 0:
+            raise ValueError("--lgq_calib_seq_len must be greater than or equal to 0.")
+        if args.lgq_subspace_rank <= 0:
+            raise ValueError("--lgq_subspace_rank must be greater than 0.")
+        if not 0 <= args.lgq_low_mid_start_quantile < 1:
+            raise ValueError("--lgq_low_mid_start_quantile must be in [0, 1).")
+        if args.lgq_steps <= 0:
+            raise ValueError("--lgq_steps must be greater than 0.")
+        if args.lgq_log_interval < 0:
+            raise ValueError("--lgq_log_interval must be greater than or equal to 0.")
+        if args.lgq_lr <= 0:
+            raise ValueError("--lgq_lr must be greater than 0.")
+        if args.lgq_lambda_logic < 0 or args.lgq_lambda_reg < 0:
+            raise ValueError("--lgq_lambda_logic and --lgq_lambda_reg must be non-negative.")
+        if args.lgq_group_size < 0:
+            raise ValueError("--lgq_group_size must be greater than or equal to 0.")
+        if args.lgq_group_smooth_tau <= 0:
+            raise ValueError("--lgq_group_smooth_tau must be greater than 0.")
+        if not args.lgq_target_patterns:
+            raise ValueError("--lgq_target_patterns must contain at least one pattern.")
+        if args.lgq_save_mode != "none" and not args.lgq_artifact_dir:
+            raise ValueError(
+                "--lgq_artifact_dir is required when --lgq_save_mode is not none."
+            )
     needs_calibration = (args.gptq and not args.gptq_load_path) or any(
         (args.smoothquant, args.awq, args.magr, args.flatquant)
     )
@@ -487,7 +592,15 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
 
     dtype = _torch_dtype_from_arg(args.dtype)
     load_device_map = "cpu"
-    if args.hif4w and not args.gptq and not args.smoothquant and not args.awq and not args.magr and not args.flatquant:
+    if (
+        args.hif4w
+        and not hif4lgq_enabled
+        and not args.gptq
+        and not args.smoothquant
+        and not args.awq
+        and not args.magr
+        and not args.flatquant
+    ):
         quant_device = _quant_device()
         if quant_device.type != "cuda":
             raise RuntimeError("HiF4 RTN quantization requires CUDA.")
@@ -506,6 +619,12 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    if hif4lgq_enabled:
+        from hif4LGQ import run_hif4lgq
+
+        logger.info("Optimizing Linear weights with hif4LGQ before quantization.")
+        run_hif4lgq(model, tokenizer, _quant_device(), args, logger)
+
     if args.gptq:
         if args.hif4w:
             logger.info("Both --hif4w and --gptq are enabled; GPTQ controls weight quantization and HiF4 RTN is skipped.")
@@ -515,17 +634,39 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
             from gptq import gptq_utils
             import brq.calib as calib
 
+            previous_attn_implementation = None
+            if args.gptq_attn_implementation != "same":
+                previous_attn_implementation = getattr(
+                    model.config,
+                    "_attn_implementation",
+                    args.attn_implementation,
+                )
+                logger.info(
+                    "Switching attention implementation from %s to %s for GPTQ calibration.",
+                    previous_attn_implementation,
+                    args.gptq_attn_implementation,
+                )
+                model.set_attn_implementation(args.gptq_attn_implementation)
+
             logger.info("Quantizing model weights with HiFloat4 GPTQ.")
-            trainloader = calib.get_loaders(
-                args.cal_dataset,
-                nsamples=args.cal_nsamples,
-                seqlen=args.cal_seqlen,
-                model=args.model,
-                eval_mode=False,
-                slice_mode=args.cal_slice_mode,
-                slice_offset=args.cal_slice_offset,
-            )
-            gptq_utils.gptq_fwrd(model, trainloader, _quant_device(), args)
+            try:
+                trainloader = calib.get_loaders(
+                    args.cal_dataset,
+                    nsamples=args.cal_nsamples,
+                    seqlen=args.cal_seqlen,
+                    model=args.model,
+                    eval_mode=False,
+                    slice_mode=args.cal_slice_mode,
+                    slice_offset=args.cal_slice_offset,
+                )
+                gptq_utils.gptq_fwrd(model, trainloader, _quant_device(), args)
+            finally:
+                if previous_attn_implementation is not None:
+                    model.set_attn_implementation(previous_attn_implementation)
+                    logger.info(
+                        "Restored attention implementation to %s after GPTQ calibration.",
+                        previous_attn_implementation,
+                    )
 
         if args.gptq_save_path:
             _save_quantized_model(model, args.gptq_save_path, tokenizer, args)
