@@ -12,7 +12,6 @@ import torch.nn as nn
 from HiFloat4.lfq import backward_lfq_chunks
 from HiFloat4.hif4gptq.gptq.gptq_utils import (
     _compute_fp_token_entropy,
-    _compute_layer_local_token_weights,
     _normalize_entropy_importance,
 )
 
@@ -29,6 +28,7 @@ from .let import (
 )
 from .modeling import capture_first_layer_inputs, get_text_model, resolve_model_structure, run_layer
 from .modules import materialize_linears, replace_linears, set_quant_state
+from .output_importance import compute_output_token_weights
 
 
 def loss_mode(layer_index, number_of_layers, use_lfq):
@@ -101,7 +101,18 @@ def omniquant(lm, args, dataloader, logger):
         model, dataloader, args.nsamples, args.seqlen, device, dtype
     )
     quant_inputs = fp_inputs.clone()
+    opd_fp_inputs = opd_quant_inputs = opd_valid_token_mask = opd_cached_kwargs = None
+    if getattr(args, "opd_dataloader", None) is not None:
+        opd_fp_inputs, opd_valid_token_mask, opd_cached_kwargs = capture_first_layer_inputs(
+            model, args.opd_dataloader, args.nsamples, args.seqlen, device, dtype
+        )
+        opd_quant_inputs = opd_fp_inputs.clone()
+        logger.info(
+            "OPD student-forced corpus loaded: %s samples, %s valid tokens.",
+            args.nsamples, int(opd_valid_token_mask.sum().item()),
+        )
     token_importance = getattr(args, "token_importance", "none")
+    entropy_direction = getattr(args, "entropy_direction", "low")
     token_weights = None
     layer_local_weights = None
     if args.epochs > 0 and token_importance == "entropy":
@@ -113,10 +124,11 @@ def omniquant(lm, args, dataloader, logger):
             valid_token_mask,
             alpha=args.entropy_alpha,
             norm_mode=args.entropy_norm,
+            entropy_direction=entropy_direction,
         )
         del entropy
-    elif args.epochs > 0 and token_importance == "entropy_grad":
-        layer_local_weights = _compute_layer_local_token_weights(
+    elif args.epochs > 0 and token_importance in {"entropy_grad", "entropy_grad_norm"}:
+        layer_local_weights = compute_output_token_weights(
             model,
             layers,
             fp_inputs,
@@ -126,8 +138,10 @@ def omniquant(lm, args, dataloader, logger):
             alpha=args.importance_alpha,
             mean_normalize=args.importance_mean_normalize,
             batch_size=args.importance_batch_size,
+            importance_mode=token_importance,
+            entropy_direction=entropy_direction,
         )
-    elif token_importance != "none" and token_importance not in {"entropy", "entropy_grad"}:
+    elif token_importance != "none" and token_importance not in {"entropy", "entropy_grad", "entropy_grad_norm"}:
         raise ValueError(f"Unsupported OmniQuant token importance mode: {token_importance}")
     logger.info("OmniQuant token-importance reconstruction mode: %s", token_importance)
     omni_states = torch.load(args.resume, map_location="cpu") if args.resume else {}
@@ -142,15 +156,24 @@ def omniquant(lm, args, dataloader, logger):
 
     for layer_index in range(len(layers)):
         mode = loss_mode(layer_index, len(layers), args.lfq)
+        if mode == "lfq" and opd_fp_inputs is not None:
+            fp_inputs = opd_fp_inputs
+            quant_inputs = opd_quant_inputs
+            valid_token_mask = opd_valid_token_mask
+            cached_kwargs = opd_cached_kwargs
+            logger.info("Final layer switched to OPD student-forced calibration tokens.")
         layer_token_weights = token_weights
         if layer_local_weights is not None:
-            layer_token_weights = torch.stack(
-                tuple(layer_local_weights[layer_index].values()), dim=0
-            ).mean(dim=0)
+            layer_token_weights = layer_local_weights[layer_index]
         logger.info("=== Start quantize layer %s (%s) ===", layer_index, mode.upper())
         layer = layers[layer_index].to(device)
         with torch.no_grad(), amp_context():
             fp_outputs = _forward_samples(layer, fp_inputs, cached_kwargs, device, dtype)
+            opd_fp_outputs = (
+                _forward_samples(layer, opd_fp_inputs, opd_cached_kwargs, device, dtype)
+                if opd_fp_inputs is not None and mode == "mse"
+                else None
+            )
             fp_outputs_from_quant = (
                 _forward_samples(layer, quant_inputs, cached_kwargs, device, dtype)
                 if args.aug_loss and mode == "mse"
@@ -271,12 +294,18 @@ def omniquant(lm, args, dataloader, logger):
         layers[layer_index] = quant_layer
         with torch.no_grad(), amp_context():
             quant_inputs = _forward_samples(quant_layer, quant_inputs, cached_kwargs, device, dtype)
+            if opd_quant_inputs is not None and mode == "mse":
+                opd_quant_inputs = _forward_samples(
+                    quant_layer, opd_quant_inputs, opd_cached_kwargs, device, dtype
+                )
         fp_inputs = fp_outputs
+        if opd_fp_outputs is not None:
+            opd_fp_inputs = opd_fp_outputs
         layers[layer_index] = quant_layer.cpu()
         if mode == "lfq":
             final_norm.cpu()
             lm_head.cpu()
-        del layer, quant_layer, fp_outputs, fp_outputs_from_quant
+        del layer, quant_layer, fp_outputs, fp_outputs_from_quant, opd_fp_outputs
         torch.cuda.empty_cache()
 
     text_config.use_cache = original_use_cache

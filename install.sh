@@ -85,13 +85,13 @@ nvcc --version
 # -------- 3. torch / 构建依赖 --------
 # 先装 torch 栈，再用 --no-build-isolation 编译 vLLM，确保编译期和运行期 ABI 一致。
 echo "[install.sh] ==> 安装 torch 2.10.0 栈"
-pip install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0"
+pip install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0"   --index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 echo "[install.sh] ==> 安装 Transformers 5.6.2"
-pip install "transformers==5.6.2"
+pip install "transformers==5.6.2" --index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 echo "[install.sh] ==> 安装 vLLM build 依赖"
-pip install -r "$REPO_ROOT/3rdparty/vllm/requirements/build.txt"
+pip install -r "$REPO_ROOT/3rdparty/vllm/requirements/build.txt" --index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # -------- 4. vLLM（editable, source build） --------
 echo "[install.sh] ==> 源码编译安装 vLLM v0.19.1 (editable, no build isolation)"
@@ -119,10 +119,10 @@ echo "[install.sh] ==> 源码编译安装 vLLM v0.19.1 (editable, no build isola
 # -------- 5. lighteval（editable, 不带 vllm extras） --------
 # lighteval[vllm] 会让 pip 重新解析并可能覆盖本地 editable vLLM；这里必须只装
 # lighteval 本体。版本约束放宽依赖 3rdparty/lighteval 里的本地补丁。
-echo "[install.sh] ==> 安装 lighteval (editable, 不带 [vllm] extras)"
-pushd "$REPO_ROOT/3rdparty/lighteval" >/dev/null
-pip install --editable . --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
-popd >/dev/null
+# echo "[install.sh] ==> 安装 lighteval (editable, 不带 [vllm] extras)"
+# pushd "$REPO_ROOT/3rdparty/lighteval" >/dev/null
+# pip install --editable . --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+# popd >/dev/null
 
 # -------- 6. HiFloat4 CUDA 扩展 --------
 echo "[install.sh] ==> 编译 HiFloat4 CUDA 扩展"
@@ -149,7 +149,7 @@ pip install \
     tqdm \
     inspect-ai \
     more_itertools \
-    langdetect
+    langdetect --index-url https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # -------- 8. 安装后导入检查 --------
 echo "[install.sh] ==> 安装后导入检查"

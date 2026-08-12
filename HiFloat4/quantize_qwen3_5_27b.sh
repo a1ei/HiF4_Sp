@@ -23,14 +23,18 @@ CAL_SEQLEN="${CAL_SEQLEN:-512}"
 CAL_SLICE_MODE="${CAL_SLICE_MODE:-head}"
 CAL_SLICE_OFFSET="${CAL_SLICE_OFFSET:-0}"
 GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
+GPTQ_CALIB_BATCH_SIZE="${GPTQ_CALIB_BATCH_SIZE:-1}"
 BLOCK_SIZE_LINEAR="${BLOCK_SIZE_LINEAR:-64}" #magr中 -1是per_layer
 TOKEN_IMPORTANCE="${TOKEN_IMPORTANCE:-none}"
+ENTROPY_DIRECTION="${ENTROPY_DIRECTION:-low}"
 ENTROPY_ALPHA="${ENTROPY_ALPHA:-1.0}"
 ENTROPY_NORM="${ENTROPY_NORM:-minmax}"
 IMPORTANCE_ALPHA="${IMPORTANCE_ALPHA:-1.0}"
 IMPORTANCE_MEAN_NORMALIZE="${IMPORTANCE_MEAN_NORMALIZE:-true}"
 IMPORTANCE_BATCH_SIZE="${IMPORTANCE_BATCH_SIZE:-1}"
 HIF4_WEIGHT_FORMAT="${HIF4_WEIGHT_FORMAT:-hif4}"
+# With GPTQ=true, this also enables A4 Hessian calibration and A4
+# layer-to-layer calibration propagation, using ACT_QUANT_FORMAT.
 HIF4A="${HIF4A:-false}"
 ACT_QUANT_FORMAT="${ACT_QUANT_FORMAT:-hif4}"
 SMOOTHQUANT_ALPHA="${SMOOTHQUANT_ALPHA:-0.5}"
@@ -79,8 +83,10 @@ python HiFloat4/main.py \
   --cal_slice_mode "${CAL_SLICE_MODE}" \
   --cal_slice_offset "${CAL_SLICE_OFFSET}" \
   --gptq_percdamp "${GPTQ_PERCDAMP}" \
+  --gptq_calib_batch_size "${GPTQ_CALIB_BATCH_SIZE}" \
   --block_size_linear "${BLOCK_SIZE_LINEAR}" \
   --token_importance "${TOKEN_IMPORTANCE}" \
+  --entropy_direction "${ENTROPY_DIRECTION}" \
   --entropy_alpha "${ENTROPY_ALPHA}" \
   --entropy_norm "${ENTROPY_NORM}" \
   --importance_alpha "${IMPORTANCE_ALPHA}" \

@@ -193,8 +193,8 @@ def _target_top1_margin(logits, target_id):
 def _replace_student_linears_with_activation_quant(model, quant_format):
     if quant_format == "none":
         return model
-    from hif4_gpu.quant_cy import QType
-    from hif4_gpu.quant_cy.layers.QLinear2 import QLinear2
+    from HiFloat4.hif4_gpu.quant_cy import QType
+    from HiFloat4.hif4_gpu.quant_cy.layers.QLinear2 import QLinear2
 
     qtype = QType({"hif4": "hifx4", "hif4-1": "hifx4_1"}[quant_format])
     modules = dict(model.named_modules())

@@ -53,6 +53,31 @@ def _run_layer(layer, hidden_states, layer_kwargs):
     return _extract_hidden(output)
 
 
+def _register_activation_quant_pre_hooks(layer, qparams):
+    """Quantize-dequantize every Linear input during GPTQ calibration.
+
+    Forward pre-hooks keep the GPTQ Linear discovery/grouping unchanged. GPTQ
+    forward hooks therefore observe the same quantized inputs used by the
+    Linear computation, and that block output propagates to the next block.
+    """
+    handles = []
+
+    def quantize_linear_input(_, args):
+        if not args or not torch.is_tensor(args[0]):
+            raise RuntimeError(
+                "GPTQ activation quantization requires a Tensor Linear input."
+            )
+        quantized_input = quant_dequant_float(
+            args[0].contiguous(), qparams, force_fp32=True
+        )
+        return (quantized_input, *args[1:])
+
+    for module in layer.modules():
+        if isinstance(module, nn.Linear):
+            handles.append(module.register_forward_pre_hook(quantize_linear_input))
+    return handles
+
+
 def _get_layers(model):
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
@@ -293,7 +318,9 @@ def _compute_fp_token_entropy(model, layers, inps, layer_kwargs, device, logits_
     return entropy
 
 
-def _normalize_entropy_importance(entropy, valid_token_mask, alpha, norm_mode):
+def _normalize_entropy_importance(
+    entropy, valid_token_mask, alpha, norm_mode, entropy_direction="low"
+):
     if entropy.shape != valid_token_mask.shape:
         raise ValueError(
             f"Entropy shape {tuple(entropy.shape)} must match token mask shape "
@@ -327,7 +354,10 @@ def _normalize_entropy_importance(entropy, valid_token_mask, alpha, norm_mode):
     else:
         raise ValueError(f"Unsupported entropy normalization mode: {norm_mode}")
 
-    normalized = normalized.max() - normalized
+    if entropy_direction == "low":
+        normalized = normalized.max() - normalized
+    elif entropy_direction != "high":
+        raise ValueError(f"Unsupported entropy direction: {entropy_direction}")
     token_weights = torch.ones_like(entropy, dtype=torch.float32)
     token_weights[entropy_valid_mask] = 1.0 + alpha * normalized
     token_weights[~valid_token_mask] = 0.0
@@ -520,7 +550,15 @@ class _LayerLocalAttribution(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None, None, None, None
 
 
-def _build_low_entropy_seed(normalized_hidden, output_head, valid_token_mask, logits_chunk_size=128):
+def _build_entropy_seed(
+    normalized_hidden,
+    output_head,
+    valid_token_mask,
+    logits_chunk_size=128,
+    entropy_direction="low",
+):
+    if entropy_direction not in {"low", "high"}:
+        raise ValueError(f"Unsupported entropy direction: {entropy_direction}")
     batch_size, seqlen, _ = normalized_hidden.shape
     entropy = torch.full(
         (batch_size, seqlen),
@@ -557,11 +595,29 @@ def _build_low_entropy_seed(normalized_hidden, output_head, valid_token_mask, lo
             if value_range > 0
             else torch.zeros_like(values)
         )
-        seed[batch_idx][sample_mask] = 1.0 - normalized
+        if value_range <= 0:
+            normalized = torch.ones_like(values)
+        elif entropy_direction == "low":
+            normalized = 1.0 - normalized
+        elif entropy_direction != "high":
+            raise ValueError(f"Unsupported entropy direction: {entropy_direction}")
+        seed[batch_idx][sample_mask] = normalized
     seed = seed.detach()
     if not torch.isfinite(seed).all() or torch.any(seed < 0):
-        raise RuntimeError("Low-entropy seed contains NaN, Inf, or negative values.")
+        raise RuntimeError("Entropy seed contains NaN, Inf, or negative values.")
     return seed
+
+
+def _build_low_entropy_seed(
+    normalized_hidden, output_head, valid_token_mask, logits_chunk_size=128
+):
+    return _build_entropy_seed(
+        normalized_hidden,
+        output_head,
+        valid_token_mask,
+        logits_chunk_size=logits_chunk_size,
+        entropy_direction="low",
+    )
 
 
 def _margin_anchor_loss(normalized_hidden, output_head, seed, logits_chunk_size=128):
@@ -649,6 +705,7 @@ def _compute_layer_local_token_weights(
     mean_normalize,
     batch_size=1,
     importance_mode="entropy_grad",
+    entropy_direction="low",
 ):
     if importance_mode not in {"entropy_grad", "entropy_grad_norm"}:
         raise ValueError(f"Unsupported layer-local importance mode: {importance_mode}")
@@ -710,11 +767,12 @@ def _compute_layer_local_token_weights(
                 sample_mask = valid_token_mask[sample_start:sample_end].to(device)
                 current_batch_size = sample_end - sample_start
                 logits_chunk_size = max(1, 128 // current_batch_size)
-                seed = _build_low_entropy_seed(
+                seed = _build_entropy_seed(
                     normalized_hidden,
                     output_head,
                     sample_mask,
                     logits_chunk_size=logits_chunk_size,
+                    entropy_direction=entropy_direction,
                 )
                 loss_anchor = _margin_anchor_loss(
                     normalized_hidden,
@@ -975,8 +1033,15 @@ def gptq_fwrd(model, dataloader, dev, args):
     logging.info("----- HiFloat4 GPTQ Quantization -----")
     device = torch.device(dev)
     weight_qtype = getattr(args, "hif4_weight_qtype", "hifx4")
+    use_act_quant = bool(getattr(args, "hif4a", False))
+    act_qtype = getattr(args, "act_quant_qtype", "hifx4")
+    act_qparams = QType(act_qtype).dim(-1) if use_act_quant else None
     if weight_qtype == "hifx4_1" and getattr(args, "block_size_linear", 64) != 64:
         raise ValueError("hif4-1 GPTQ requires --block_size_linear 64.")
+    logging.info(
+        "GPTQ calibration activation mode: %s",
+        act_qtype if use_act_quant else "A16/BF16 (disabled)",
+    )
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -985,6 +1050,7 @@ def gptq_fwrd(model, dataloader, dev, args):
     dtype = next(iter(model.parameters())).dtype
     max_samples = args.cal_nsamples
     token_importance = getattr(args, "token_importance", "none")
+    entropy_direction = getattr(args, "entropy_direction", "low")
     inps, layer_kwargs, valid_token_mask = _capture_calibration_inputs(
         model,
         layers,
@@ -995,6 +1061,15 @@ def gptq_fwrd(model, dataloader, dev, args):
         dtype,
     )
     nsamples = inps.shape[0]
+    calib_batch_size = min(getattr(args, "gptq_calib_batch_size", 1), nsamples)
+    if calib_batch_size <= 0:
+        raise ValueError("GPTQ calibration batch size must be greater than 0.")
+    logging.info(
+        "GPTQ calibration batch size: %d (%d samples, %d batches).",
+        calib_batch_size,
+        nsamples,
+        math.ceil(nsamples / calib_batch_size),
+    )
     token_weights = None
     layer_local_weights = None
 
@@ -1005,6 +1080,7 @@ def gptq_fwrd(model, dataloader, dev, args):
             valid_token_mask,
             alpha=args.entropy_alpha,
             norm_mode=args.entropy_norm,
+            entropy_direction=entropy_direction,
         )
         del entropy, inps
 
@@ -1032,6 +1108,7 @@ def gptq_fwrd(model, dataloader, dev, args):
             mean_normalize=args.importance_mean_normalize,
             batch_size=args.importance_batch_size,
             importance_mode=token_importance,
+            entropy_direction=entropy_direction,
         )
     elif token_importance != "none":
         raise ValueError(f"Unsupported GPTQ token importance mode: {token_importance}")
@@ -1041,10 +1118,16 @@ def gptq_fwrd(model, dataloader, dev, args):
 
     for i in tqdm.tqdm(range(len(layers)), desc="(GPTQ Quant.) Layers"):
         layer = layers[i].to(device)
+        act_quant_handles = (
+            _register_activation_quant_pre_hooks(layer, act_qparams)
+            if act_qparams is not None
+            else []
+        )
         logging.info(
-            "GPTQ layer %d token-importance Hessian mode: %s",
+            "GPTQ layer %d token-importance Hessian mode: %s; activation calibration: %s",
             i,
             token_importance,
+            act_qtype if use_act_quant else "disabled",
         )
         full = find_qlayers(layer, layers=[nn.Linear])
         quant_groups = _get_quant_groups(model, layer)
@@ -1088,15 +1171,16 @@ def gptq_fwrd(model, dataloader, dev, args):
 
             handles = [subset[name].register_forward_hook(add_batch(name)) for name in gptq_blocks]
 
-            for j in range(nsamples):
+            for start in range(0, nsamples, calib_batch_size):
+                end = min(start + calib_batch_size, nsamples)
                 active_token_weights = (
-                    group_token_weights[j].to(device)
+                    group_token_weights[start:end].to(device)
                     if group_token_weights is not None
                     else None
                 )
-                layer_input = inps[j].unsqueeze(0).to(device)
+                layer_input = inps[start:end].to(device)
                 current_layer_kwargs = _layer_kwargs_for_current_layer(model, layer, layer_input, layer_kwargs)
-                outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
+                outs[start:end].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
 
             for handle in handles:
                 handle.remove()
@@ -1108,10 +1192,14 @@ def gptq_fwrd(model, dataloader, dev, args):
                 )
                 block.free()
 
-        for j in range(nsamples):
-            layer_input = inps[j].unsqueeze(0).to(device)
+        for start in range(0, nsamples, calib_batch_size):
+            end = min(start + calib_batch_size, nsamples)
+            layer_input = inps[start:end].to(device)
             current_layer_kwargs = _layer_kwargs_for_current_layer(model, layer, layer_input, layer_kwargs)
-            outs[j].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
+            outs[start:end].copy_(_run_layer(layer, layer_input, current_layer_kwargs)[0].cpu())
+
+        for handle in act_quant_handles:
+            handle.remove()
 
         layers[i] = layer.cpu()
         del layer

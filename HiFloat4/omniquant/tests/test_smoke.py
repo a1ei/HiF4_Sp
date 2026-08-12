@@ -12,7 +12,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGe
 
 from HiFloat4.lfq import backward_lfq_chunks, lfq_loss
 from HiFloat4.omniquant.calibration import _weighted_mse, loss_mode, omniquant
-from HiFloat4.omniquant.datautils import _slice_ids
+from HiFloat4.omniquant.datautils import _slice_ids, get_token_file
 from HiFloat4.omniquant.quantizer import UniformAffineQuantizer
 from HiFloat4.hif4_gpu.quant_cy import QType, quant_dequant_float
 
@@ -50,6 +50,17 @@ class TestLFQ(unittest.TestCase):
         self.assertTrue(torch.allclose(weighted, torch.tensor(3.0)))
         weighted.backward()
         self.assertIsNotNone(output.grad)
+
+    def test_opd_token_file_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "opd.pt")
+            ids = torch.arange(16).reshape(2, 8)
+            mask = torch.ones_like(ids, dtype=torch.bool)
+            mask[1, -2:] = False
+            torch.save({"input_ids": ids, "attention_mask": mask}, path)
+            samples = get_token_file(path, 2, 8)
+            self.assertTrue(torch.equal(samples[1]["input_ids"], ids[1:2]))
+            self.assertEqual(int(samples[1]["attention_mask"].sum()), 6)
 
     def test_calibration_head_slice(self):
         input_ids = torch.arange(12).reshape(1, 12)
@@ -136,7 +147,7 @@ def args_for(output_dir, lfq):
 
 @unittest.skipUnless(torch.cuda.is_available(), "OmniQuant calibration requires CUDA")
 class TestTinyQwenOmniQuant(unittest.TestCase):
-    def _run(self, use_lfq, token_importance="none"):
+    def _run(self, use_lfq, token_importance="none", use_opd=False):
         torch.manual_seed(2)
         model = tiny_model().to(dtype=torch.bfloat16)
         original = copy.deepcopy(model.state_dict())
@@ -144,6 +155,11 @@ class TestTinyQwenOmniQuant(unittest.TestCase):
         with tempfile.TemporaryDirectory() as output_dir:
             calibration_args = args_for(output_dir, use_lfq)
             calibration_args.token_importance = token_importance
+            if use_opd:
+                calibration_args.opd_dataloader = [
+                    {"input_ids": sample.clone(), "attention_mask": torch.ones_like(sample)}
+                    for sample in reversed(samples)
+                ]
             calibrated = omniquant(TinyLM(model, torch.device("cuda")), calibration_args, samples, logging.getLogger("tiny-omniquant"))
             checkpoint = torch.load(os.path.join(output_dir, "omni_parameters.pth"), map_location="cpu")
             self.assertEqual(set(checkpoint), {0, 1})
@@ -180,6 +196,10 @@ class TestTinyQwenOmniQuant(unittest.TestCase):
     def test_lfq_routes_only_last_layer(self):
         self.assertEqual([loss_mode(i, 2, True) for i in range(2)], ["mse", "lfq"])
         self._run(True)
+
+    def test_opd_lfq_and_output_gradient_modes_run(self):
+        self._run(True, "entropy_grad", use_opd=True)
+        self._run(True, "entropy_grad_norm")
 
 
 if __name__ == "__main__":

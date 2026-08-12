@@ -342,7 +342,16 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
         choices=["hif4", "hif4-1", "nvfp4"],
         help="HiF4 weight fake quant format for RTN/GPTQ.",
     )
-    parser.add_argument("--hif4a", type=str2bool, default=False, help="Enable HiF4 input activation fake quantization")
+    parser.add_argument(
+        "--hif4a",
+        type=str2bool,
+        default=False,
+        help=(
+            "Enable HiF4 input activation fake quantization. For new GPTQ "
+            "quantization this also uses quantized Linear inputs for Hessian "
+            "collection and layer-to-layer calibration propagation."
+        ),
+    )
     parser.add_argument(
         "--act_quant_format",
         type=str,
@@ -355,6 +364,12 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
 
     parser.add_argument("--gptq", type=str2bool, default=False)
     parser.add_argument("--gptq_percdamp", type=float, default=0.01)
+    parser.add_argument(
+        "--gptq_calib_batch_size",
+        type=int,
+        default=1,
+        help="Number of fixed-length calibration samples per GPTQ block forward.",
+    )
     parser.add_argument(
         "--cal_dataset",
         type=str,
@@ -392,6 +407,13 @@ def arg_parser(interactive: bool = True) -> argparse.Namespace:
         type=str,
         default="minmax",
         choices=["minmax", "zscore", "mean"],
+    )
+    parser.add_argument(
+        "--entropy_direction",
+        type=str,
+        default="low",
+        choices=["low", "high"],
+        help="Prioritize low- or high-entropy next-token positions.",
     )
     parser.add_argument("--importance_alpha", type=float, default=1.0)
     parser.add_argument("--importance_mean_normalize", type=str2bool, default=True)
@@ -478,6 +500,8 @@ def run_main(args: argparse.Namespace, logger: logging.Logger) -> None:
             raise ValueError("--cal_nsamples must be greater than 0.")
         if args.cal_seqlen <= 0:
             raise ValueError("--cal_seqlen must be greater than 0.")
+        if args.gptq_calib_batch_size <= 0:
+            raise ValueError("--gptq_calib_batch_size must be greater than 0.")
         if args.token_importance in {"entropy", "entropy_grad", "entropy_grad_norm"} and args.cal_seqlen < 2:
             raise ValueError("Entropy-based token importance requires --cal_seqlen to be at least 2.")
         if args.cal_slice_offset < 0:

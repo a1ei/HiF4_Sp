@@ -2,6 +2,8 @@
 
 import random
 
+import torch
+
 from datasets import load_dataset
 
 
@@ -52,3 +54,23 @@ def get_loaders(name, nsamples, seed, seqlen, tokenizer, slice_mode="random", sl
     if slice_mode != "offset" and slice_offset != 0:
         raise ValueError("Calibration slice offset is only valid in offset mode.")
     return get_s1k(nsamples, seed, seqlen, tokenizer, slice_mode, slice_offset)
+
+
+def get_token_file(path, nsamples, seqlen):
+    """Load an OPD student-forced corpus containing token ids, never logits."""
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or "input_ids" not in payload:
+        raise ValueError("OPD data must be a dict containing input_ids.")
+    input_ids = payload["input_ids"].long()
+    attention_mask = payload.get("attention_mask", torch.ones_like(input_ids)).bool()
+    if input_ids.ndim != 2 or attention_mask.shape != input_ids.shape:
+        raise ValueError("OPD input_ids and attention_mask must have matching [N, S] shapes.")
+    if input_ids.shape[0] < nsamples or input_ids.shape[1] != seqlen:
+        raise ValueError(
+            f"OPD data has shape {tuple(input_ids.shape)}; expected at least "
+            f"[{nsamples}, {seqlen}]."
+        )
+    return [
+        {"input_ids": input_ids[i : i + 1], "attention_mask": attention_mask[i : i + 1]}
+        for i in range(nsamples)
+    ]

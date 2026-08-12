@@ -532,12 +532,17 @@ def awq_fwrd(model, dataloader, dev, args):
     layer_kwargs = {k: v for k, v in cache.items() if k != "i"}
     valid_token_mask = torch.ones((nsamples, args.cal_seqlen), dtype=torch.bool)
     token_importance = getattr(args, "token_importance", "none")
+    entropy_direction = getattr(args, "entropy_direction", "low")
     token_weights = None
     layer_local_weights = None
     if token_importance == "entropy":
         entropy = _compute_fp_token_entropy(model, layers, inps.cpu(), layer_kwargs, device)
         token_weights = _normalize_entropy_importance(
-            entropy, valid_token_mask, alpha=args.entropy_alpha, norm_mode=args.entropy_norm
+            entropy,
+            valid_token_mask,
+            alpha=args.entropy_alpha,
+            norm_mode=args.entropy_norm,
+            entropy_direction=entropy_direction,
         )
         del entropy
     elif token_importance == "entropy_grad":
@@ -546,6 +551,7 @@ def awq_fwrd(model, dataloader, dev, args):
             alpha=args.importance_alpha,
             mean_normalize=args.importance_mean_normalize,
             batch_size=args.importance_batch_size,
+            entropy_direction=entropy_direction,
         )
     elif token_importance != "none":
         raise ValueError(f"Unsupported AWQ token importance mode: {token_importance}")
