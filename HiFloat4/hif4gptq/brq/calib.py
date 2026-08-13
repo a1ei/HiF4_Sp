@@ -208,6 +208,99 @@ def get_s1k_1_1(
     )
 
 
+def get_s1k_reasoning(
+    nsamples,
+    seed,
+    seqlen,
+    model,
+    hf_token=None,
+    slice_mode="head",
+    slice_offset=0,
+):
+    """Return fixed-length s1K samples with an exact trajectory token mask.
+
+    This is intentionally separate from ``get_s1k_1_1``: existing GPTQ
+    callers keep receiving tensors, while the RMSNorm adaptation experiment
+    receives the extra masks it needs for its teacher-forced objective.
+    """
+    _validate_sequence_calibration_args(
+        "s1k-1.1", nsamples, seqlen, False, slice_mode, slice_offset
+    )
+    tokenizer = _get_tokenizer(model, hf_token)
+    train_data = load_dataset("simplescaling/s1K-1.1", split="train")
+    rng = random.Random(seed)
+    indices = list(range(len(train_data)))
+    rng.shuffle(indices)
+
+    samples = []
+    for idx in indices:
+        row = train_data[idx]
+        question = row.get("question")
+        trajectory = row.get("deepseek_thinking_trajectory")
+        attempt = row.get("deepseek_attempt")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(f"s1k-1.1 sample {idx} has an empty or invalid question field.")
+        if not isinstance(trajectory, str) or not trajectory.strip():
+            raise ValueError(
+                f"s1k-1.1 sample {idx} has an empty or invalid deepseek_thinking_trajectory field."
+            )
+        if not isinstance(attempt, str) or not attempt.strip():
+            raise ValueError(f"s1k-1.1 sample {idx} has an empty or invalid deepseek_attempt field.")
+
+        # Tokenize the three semantic spans independently so the reasoning
+        # boundary is explicit instead of inferred from decoded text.
+        prefix_ids = tokenizer(
+            question + "\n\n", add_special_tokens=False
+        ).input_ids
+        reasoning_ids = tokenizer(
+            trajectory, add_special_tokens=False
+        ).input_ids
+        suffix_ids = tokenizer(
+            "\n\n" + attempt, add_special_tokens=False
+        ).input_ids
+        ids = prefix_ids + reasoning_ids + suffix_ids
+        mask = [False] * len(prefix_ids) + [True] * len(reasoning_ids) + [False] * len(suffix_ids)
+        if len(ids) < seqlen:
+            continue
+
+        max_start = len(ids) - seqlen
+        if slice_mode == "head":
+            start = 0
+        elif slice_mode == "tail":
+            start = max_start
+        elif slice_mode == "offset":
+            if slice_offset > max_start:
+                continue
+            start = slice_offset
+        elif slice_mode == "random":
+            start = rng.randint(0, max_start)
+        else:
+            raise ValueError(f"Unsupported slice_mode: {slice_mode}")
+
+        sample_ids = torch.tensor(ids[start : start + seqlen], dtype=torch.long).unsqueeze(0)
+        reasoning_mask = torch.tensor(
+            mask[start : start + seqlen], dtype=torch.bool
+        ).unsqueeze(0)
+        # A reasoning label at position zero has no in-window causal predictor.
+        if not reasoning_mask[:, 1:].any():
+            continue
+        samples.append(
+            {
+                "input_ids": sample_ids,
+                "attention_mask": torch.ones_like(sample_ids),
+                "reasoning_mask": reasoning_mask,
+            }
+        )
+        if len(samples) == nsamples:
+            return samples
+
+    raise ValueError(
+        "s1k-1.1 does not contain enough fixed-length samples with reasoning labels: "
+        f"requested={nsamples}, collected={len(samples)}, seqlen={seqlen}, "
+        f"slice_mode={slice_mode}, slice_offset={slice_offset}."
+    )
+
+
 def _get_livecodebench_questions_for_dedup():
     livecodebench = load_dataset("lighteval/code_generation_lite", "v6", split="test")
     questions = set()
